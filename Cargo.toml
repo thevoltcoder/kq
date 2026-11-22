@@ -6,11 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 block2 = "0.6.2"
-clap = { version = "4.6.9", features = ["derive"] }
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
 objc2-audio-toolbox = "0.3.2"
 objc2-avf-audio = { version = "0.3.2", features = ["objc2-audio-toolbox"] }
-objc2-core-audio-kit = "0.3.2"
+objc2-core-audio-kit = { version = "0.3.2", features = ["AUGenericView", "objc2-app-kit", "objc2-audio-toolbox"] }
 objc2-foundation = "0.3.2"
 rfd = "0.18.0"

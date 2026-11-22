@@ -1,10 +1,10 @@
 use anyhow::Context;
 use block2::RcBlock;
-use clap::Parser;
 use objc2::{rc::*, runtime::*, *};
 use objc2_app_kit::*;
 use objc2_audio_toolbox::*;
 use objc2_avf_audio::*;
+use objc2_core_audio_kit::AUGenericView;
 use objc2_foundation::*;
 use std::{
     cell::RefCell,
@@ -17,265 +17,66 @@ const FADE_SECS: f32 = 1.0;
 const FADE_MIN_DB: f32 = -60.0;
 const FADE_TICK_SECS: f64 = 1.0 / 60.0;
 const AUDIO_EXTS: &[&str] = &["wav", "mp3", "m4a", "aac", "aif", "aiff", "caf", "flac"];
+const COCOA_UI_PROPERTY: u32 = 31;
 
-macro_rules! define_effects {
-    (
-        $(
-            $variant:ident ($subtype:expr) {
-                $(
-                    $field:ident : $ty:ty = $default:expr => $param_id:expr
-                ),* $(,)?
-            }
-        ),* $(,)?
-    ) => {
-        #[derive(Debug, Clone)]
-        pub enum EffectCmd {
-            $(
-                $variant($variant),
-            )*
-        }
-
-        $(
-            #[derive(Debug, Clone)]
-            pub struct $variant {
-                $(
-                    pub $field: $ty,
-                )*
-            }
-
-            impl Default for $variant {
-                fn default() -> Self {
-                    Self {
-                        $(
-                            $field: $default,
-                        )*
-                    }
-                }
-            }
-        )*
-
-        impl std::str::FromStr for EffectCmd {
-            type Err = String;
-
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                let (name, args) = s.split_once(':').unwrap_or((s, ""));
-                match name.to_lowercase().as_str() {
-                    $(
-                        n if n == stringify!($variant).to_lowercase() => {
-                            let mut cfg = $variant::default();
-                            for pair in args.split(',').filter(|p| !p.is_empty()) {
-                                let (k, v) = pair
-                                    .split_once('=')
-                                    .ok_or_else(|| format!("expected key=value, got '{pair}'"))?;
-                                match k {
-                                    $(
-                                        k if k == stringify!($field) => {
-                                            cfg.$field = v
-                                                .parse::<$ty>()
-                                                .map_err(|e| format!("invalid value for {k}: {e}"))?;
-                                        }
-                                    )*
-                                    _ => {
-                                        return Err(format!(
-                                            "unknown parameter '{k}' for {}",
-                                            stringify!($variant)
-                                        ))
-                                    }
-                                }
-                            }
-                            Ok(EffectCmd::$variant(cfg))
-                        }
-                    )*
-                    _ => Err(format!("unknown effect '{name}'")),
-                }
-            }
-        }
-
-        pub const EFFECTS_HELP: &str = concat!(
-            "Add an effect to the chain. Repeat the flag to stack effects in order.\n",
-            "Format: NAME or NAME:key=value,key=value\n\n",
-            "Effects (defaults shown):\n",
-            $(
-                "  ", stringify!($variant), ": ",
-                $( stringify!($field), "=", stringify!($default), " ", )*
-                "\n",
-            )*
-        );
-
-        impl EffectCmd {
-            pub fn build_node(&self) -> Retained<AVAudioUnitEffect> {
-                match self {
-                    $(
-                        EffectCmd::$variant(cfg) => {
-                            let desc = AudioComponentDescription {
-                                componentType: kAudioUnitType_Effect,
-                                componentSubType: $subtype,
-                                componentManufacturer: kAudioUnitManufacturer_Apple,
-                                componentFlags: 0,
-                                componentFlagsMask: 0,
-                            };
-                            unsafe {
-                                let node = AVAudioUnitEffect::initWithAudioComponentDescription(
-                                    AVAudioUnitEffect::alloc(),
-                                    desc,
-                                );
-                                if let Some(tree) = node.AUAudioUnit().parameterTree() {
-                                    $(
-                                        if let Some(param) = tree.parameterWithAddress($param_id as u64) {
-                                            param.setValue(cfg.$field as f32);
-                                        }
-                                    )*
-                                }
-                                node
-                            }
-                        }
-                    )*
-                }
-            }
-        }
-    };
+#[repr(C)]
+struct RawAudioUnit {
+    _private: [u8; 0],
 }
 
-define_effects! {
-    Lowpass(kAudioUnitSubType_LowPassFilter) {
-        cutoff_hz: f32 = 8000.0 => kLowPassParam_CutoffFrequency,
-        resonance: f32 = 0.0    => kLowPassParam_Resonance,
-    },
-    Highpass(kAudioUnitSubType_HighPassFilter) {
-        cutoff_hz: f32 = 80.0 => kHipassParam_CutoffFrequency,
-        resonance: f32 = 0.0  => kHipassParam_Resonance,
-    },
-    Bandpass(kAudioUnitSubType_BandPassFilter) {
-        center_hz: f32 = 1000.0 => kBandpassParam_CenterFrequency,
-        bandwidth: f32 = 1200.0 => kBandpassParam_Bandwidth,
-    },
-    Lowshelf(kAudioUnitSubType_LowShelfFilter) {
-        cutoff_hz: f32 = 100.0 => kAULowShelfParam_CutoffFrequency,
-        gain: f32 = 3.0        => kAULowShelfParam_Gain,
-    },
-    Highshelf(kAudioUnitSubType_HighShelfFilter) {
-        cutoff_hz: f32 = 10000.0 => kHighShelfParam_CutOffFrequency,
-        gain: f32 = 3.0          => kHighShelfParam_Gain,
-    },
-    Eq(kAudioUnitSubType_ParametricEQ) {
-        center_hz: f32 = 1000.0 => kParametricEQParam_CenterFreq,
-        q: f32 = 1.0            => kParametricEQParam_Q,
-        gain: f32 = 3.0         => kParametricEQParam_Gain,
-    },
-    Eq4(kAudioUnitSubType_NBandEQ) {
-        global_gain: f32 = 0.0 => kAUNBandEQParam_GlobalGain,
-        b1_bypass: f32 = 0.0   => kAUNBandEQParam_BypassBand + 0,
-        b1_type: f32 = 7.0     => kAUNBandEQParam_FilterType + 0,
-        b1_hz: f32 = 100.0     => kAUNBandEQParam_Frequency + 0,
-        b1_gain: f32 = 0.0     => kAUNBandEQParam_Gain + 0,
-        b1_bw: f32 = 0.5       => kAUNBandEQParam_Bandwidth + 0,
-        b2_bypass: f32 = 0.0   => kAUNBandEQParam_BypassBand + 1,
-        b2_type: f32 = 0.0     => kAUNBandEQParam_FilterType + 1,
-        b2_hz: f32 = 400.0     => kAUNBandEQParam_Frequency + 1,
-        b2_gain: f32 = 0.0     => kAUNBandEQParam_Gain + 1,
-        b2_bw: f32 = 0.5       => kAUNBandEQParam_Bandwidth + 1,
-        b3_bypass: f32 = 0.0   => kAUNBandEQParam_BypassBand + 2,
-        b3_type: f32 = 0.0     => kAUNBandEQParam_FilterType + 2,
-        b3_hz: f32 = 2500.0    => kAUNBandEQParam_Frequency + 2,
-        b3_gain: f32 = 0.0     => kAUNBandEQParam_Gain + 2,
-        b3_bw: f32 = 0.5       => kAUNBandEQParam_Bandwidth + 2,
-        b4_bypass: f32 = 0.0   => kAUNBandEQParam_BypassBand + 3,
-        b4_type: f32 = 8.0     => kAUNBandEQParam_FilterType + 3,
-        b4_hz: f32 = 10000.0   => kAUNBandEQParam_Frequency + 3,
-        b4_gain: f32 = 0.0     => kAUNBandEQParam_Gain + 3,
-        b4_bw: f32 = 0.5       => kAUNBandEQParam_Bandwidth + 3,
-    },
-    Graphiceq(kAudioUnitSubType_GraphicEQ) {
-        bands: f32 = 0.0   => 10000,
-        hz31: f32 = 0.0    => 0,
-        hz63: f32 = 0.0    => 1,
-        hz125: f32 = 0.0   => 2,
-        hz250: f32 = 0.0   => 3,
-        hz500: f32 = 0.0   => 4,
-        hz1k: f32 = 0.0    => 5,
-        hz2k: f32 = 0.0    => 6,
-        hz4k: f32 = 0.0    => 7,
-        hz8k: f32 = 0.0    => 8,
-        hz16k: f32 = 0.0   => 9,
-    },
-    Compressor(kAudioUnitSubType_DynamicsProcessor) {
-        threshold: f32 = -18.0         => kDynamicsProcessorParam_Threshold,
-        headroom: f32 = 9.0            => kDynamicsProcessorParam_HeadRoom,
-        expansion_ratio: f32 = 1.0     => kDynamicsProcessorParam_ExpansionRatio,
-        expansion_threshold: f32 = 2.0 => kDynamicsProcessorParam_ExpansionThreshold,
-        attack: f32 = 0.015            => kDynamicsProcessorParam_AttackTime,
-        release: f32 = 0.15            => kDynamicsProcessorParam_ReleaseTime,
-        gain: f32 = 3.0                => kDynamicsProcessorParam_OverallGain,
-    },
-    Limiter(kAudioUnitSubType_PeakLimiter) {
-        attack: f32 = 0.001 => kLimiterParam_AttackTime,
-        decay: f32 = 0.05   => kLimiterParam_DecayTime,
-        pregain: f32 = 0.0  => kLimiterParam_PreGain,
-    },
-    Delay(kAudioUnitSubType_Delay) {
-        mix: f32 = 25.0         => kDelayParam_WetDryMix,
-        time: f32 = 0.3         => kDelayParam_DelayTime,
-        feedback: f32 = 30.0    => kDelayParam_Feedback,
-        cutoff_hz: f32 = 8000.0 => kDelayParam_LopassCutoff,
-    },
-    Reverb(kAudioUnitSubType_Reverb2) {
-        mix: f32 = 25.0          => kReverb2Param_DryWetMix,
-        gain: f32 = 0.0          => kReverb2Param_Gain,
-        min_delay: f32 = 0.008   => kReverb2Param_MinDelayTime,
-        max_delay: f32 = 0.05    => kReverb2Param_MaxDelayTime,
-        decay_0hz: f32 = 2.0     => kReverb2Param_DecayTimeAt0Hz,
-        decay_nyquist: f32 = 1.0 => kReverb2Param_DecayTimeAtNyquist,
-        randomize: f32 = 100.0   => kReverb2Param_RandomizeReflections,
-    },
-    Matrixreverb(kAudioUnitSubType_MatrixReverb) {
-        mix: f32 = 30.0              => kReverbParam_DryWetMix,
-        small_large: f32 = 50.0      => kReverbParam_SmallLargeMix,
-        small_size: f32 = 0.06       => kReverbParam_SmallSize,
-        large_size: f32 = 0.5        => kReverbParam_LargeSize,
-        pre_delay: f32 = 0.025       => kReverbParam_PreDelay,
-        large_delay: f32 = 0.04      => kReverbParam_LargeDelay,
-        small_density: f32 = 0.5     => kReverbParam_SmallDensity,
-        large_density: f32 = 0.5     => kReverbParam_LargeDensity,
-        large_delay_range: f32 = 0.3 => kReverbParam_LargeDelayRange,
-        small_brightness: f32 = 0.5  => kReverbParam_SmallBrightness,
-        large_brightness: f32 = 0.5  => kReverbParam_LargeBrightness,
-        small_delay_range: f32 = 0.3 => kReverbParam_SmallDelayRange,
-        mod_rate: f32 = 1.0          => kReverbParam_ModulationRate,
-        mod_depth: f32 = 0.2         => kReverbParam_ModulationDepth,
-    },
-    Distortion(kAudioUnitSubType_Distortion) {
-        delay: f32 = 0.1            => kDistortionParam_Delay,
-        decay_rate: f32 = 1.0       => kDistortionParam_Decay,
-        delay_mix: f32 = 0.0        => kDistortionParam_DelayMix,
-        decimation: f32 = 0.0       => kDistortionParam_Decimation,
-        rounding: f32 = 0.0         => kDistortionParam_Rounding,
-        decimation_mix: f32 = 0.0   => kDistortionParam_DecimationMix,
-        linear: f32 = 1.0           => kDistortionParam_LinearTerm,
-        squared: f32 = 0.3          => kDistortionParam_SquaredTerm,
-        cubic: f32 = 0.0            => kDistortionParam_CubicTerm,
-        polynomial_mix: f32 = 100.0 => kDistortionParam_PolynomialMix,
-        ring_freq1: f32 = 100.0     => kDistortionParam_RingModFreq1,
-        ring_freq2: f32 = 100.0     => kDistortionParam_RingModFreq2,
-        ring_balance: f32 = 50.0    => kDistortionParam_RingModBalance,
-        ring_mix: f32 = 0.0         => kDistortionParam_RingModMix,
-        soft_clip_gain: f32 = 0.0   => kDistortionParam_SoftClipGain,
-        final_mix: f32 = 100.0      => kDistortionParam_FinalMix,
-    },
+unsafe impl RefEncode for RawAudioUnit {
+    const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct(
+        "ComponentInstanceRecord",
+        &[Encoding::Array(1, &Encoding::LongLong)],
+    ));
 }
 
-#[derive(Parser)]
-#[command(about = "Play an audio file using AVAudioEngine")]
-struct Cli {
-    file: Option<PathBuf>,
+fn raw_audio_unit(node: &AVAudioUnitEffect) -> *mut RawAudioUnit {
+    unsafe { msg_send![node, audioUnit] }
+}
 
-    #[arg(
-        short,
-        long,
-        value_name = "NAME[:KEY=VAL,...]",
-        help = "Effect to apply (see --help for the list)",
-        long_help = EFFECTS_HELP
-    )]
-    effect: Vec<EffectCmd>,
+struct Installed {
+    name: String,
+    desc: AudioComponentDescription,
+}
+
+struct ChainItem {
+    index: usize,
+    node: Retained<AVAudioUnitEffect>,
+}
+
+struct Editor {
+    #[allow(dead_code)]
+    window: Retained<NSWindow>,
+    #[allow(dead_code)]
+    factory: Option<Retained<AnyObject>>,
+}
+
+fn list_installed_effects() -> Vec<Installed> {
+    unsafe {
+        let manager = AVAudioUnitComponentManager::sharedAudioUnitComponentManager();
+        let mut list: Vec<Installed> = Vec::new();
+        for ty in [kAudioUnitType_Effect, kAudioUnitType_MusicEffect] {
+            let wildcard = AudioComponentDescription {
+                componentType: ty,
+                componentSubType: 0,
+                componentManufacturer: 0,
+                componentFlags: 0,
+                componentFlagsMask: 0,
+            };
+            list.extend(
+                manager
+                    .componentsMatchingDescription(wildcard)
+                    .iter()
+                    .map(|c| Installed {
+                        name: format!("{} - {}", c.manufacturerName(), c.name()),
+                        desc: c.audioComponentDescription(),
+                    }),
+            );
+        }
+        list.sort_by_key(|i| i.name.to_lowercase());
+        list
+    }
 }
 
 fn is_audio_path(path: &Path) -> bool {
@@ -294,17 +95,94 @@ fn fade_gain(start_gain: f32, min_db: f32, progress: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
 
+fn cocoa_view(unit: *mut RawAudioUnit) -> Option<(Retained<NSView>, Retained<AnyObject>)> {
+    unsafe {
+        let au = unit as AudioUnit;
+        let mut size: u32 = 0;
+        let mut writable: u8 = 0;
+        let status = AudioUnitGetPropertyInfo(
+            au,
+            COCOA_UI_PROPERTY,
+            kAudioUnitScope_Global,
+            0,
+            &mut size,
+            &mut writable,
+        );
+        if status != 0 || (size as usize) < 2 * std::mem::size_of::<usize>() {
+            return None;
+        }
+
+        let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        let mut got = size;
+        let status = AudioUnitGetProperty(
+            au,
+            COCOA_UI_PROPERTY,
+            kAudioUnitScope_Global,
+            0,
+            NonNull::from(&mut buffer[0]).cast::<std::ffi::c_void>(),
+            NonNull::from(&mut got),
+        );
+        if status != 0 {
+            return None;
+        }
+
+        let url = Retained::from_raw(buffer[0] as *mut NSURL)?;
+        let class_name = Retained::from_raw(buffer[1] as *mut NSString)?;
+
+        let bundle = NSBundle::bundleWithURL(&url)?;
+        bundle.load();
+        let class = NSClassFromString(&class_name)?;
+
+        let allocated: Allocated<AnyObject> = msg_send![class, alloc];
+        let factory: Retained<AnyObject> = msg_send![allocated, init];
+        let view: Option<Retained<NSView>> =
+            msg_send![&*factory, uiViewForAudioUnit: au, withSize: NSSize::new(0.0, 0.0)];
+        view.map(|v| (v, factory))
+    }
+}
+
+fn editor_window(mtm: MainThreadMarker, view: &NSView, title: &str) -> Retained<NSWindow> {
+    let mut size = view.frame().size;
+    if size.width < 1.0 || size.height < 1.0 {
+        size = NSSize::new(480.0, 320.0);
+    }
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            mtm.alloc::<NSWindow>(),
+            NSRect::new(NSPoint::new(0.0, 0.0), size),
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&NSString::from_str(title));
+    window.setContentView(Some(view));
+    window.center();
+    window.makeKeyAndOrderFront(None);
+    window
+}
+
 struct AudioState {
     engine: Retained<AVAudioEngine>,
     player: Retained<AVAudioPlayerNode>,
-    #[allow(dead_code)]
     nodes: Vec<Retained<AVAudioUnitEffect>>,
 }
 
 struct AppIvars {
-    effects: Vec<EffectCmd>,
     field: Retained<NSTextField>,
     error_label: Retained<NSTextField>,
+    search: Retained<NSSearchField>,
+    available_table: Retained<NSTableView>,
+    chain_table: Retained<NSTableView>,
+    installed: Vec<Installed>,
+    filtered: RefCell<Vec<usize>>,
+    chain: RefCell<Vec<ChainItem>>,
+    editors: RefCell<Vec<Editor>>,
     audio: RefCell<Option<AudioState>>,
     fade: RefCell<Option<Retained<NSTimer>>>,
 }
@@ -329,6 +207,39 @@ define_class!(
         }
     }
 
+    unsafe impl NSTableViewDataSource for AppHandler {
+        #[unsafe(method(numberOfRowsInTableView:))]
+        fn number_of_rows_in_table_view(&self, table: &NSTableView) -> NSInteger {
+            if std::ptr::eq(table, &*self.ivars().available_table) {
+                self.ivars().filtered.borrow().len() as NSInteger
+            } else {
+                self.ivars().chain.borrow().len() as NSInteger
+            }
+        }
+
+        #[unsafe(method(tableView:objectValueForTableColumn:row:))]
+        fn table_view_object_value(
+            &self,
+            table: &NSTableView,
+            _column: Option<&NSTableColumn>,
+            row: NSInteger,
+        ) -> *mut NSObject {
+            let ivars = self.ivars();
+            let index = if std::ptr::eq(table, &*ivars.available_table) {
+                ivars.filtered.borrow().get(row as usize).copied()
+            } else {
+                ivars.chain.borrow().get(row as usize).map(|c| c.index)
+            };
+            match index {
+                Some(i) => {
+                    let title = NSString::from_str(&ivars.installed[i].name);
+                    Retained::autorelease_ptr(title) as *mut NSObject
+                }
+                None => std::ptr::null_mut(),
+            }
+        }
+    }
+
     impl AppHandler {
         #[unsafe(method(onPlay:))]
         fn on_play(&self, _sender: Option<&AnyObject>) {
@@ -341,7 +252,15 @@ define_class!(
                 return;
             }
 
-            match start_audio(&path, &self.ivars().effects) {
+            let nodes: Vec<Retained<AVAudioUnitEffect>> = self
+                .ivars()
+                .chain
+                .borrow()
+                .iter()
+                .map(|c| c.node.clone())
+                .collect();
+
+            match start_audio(&path, nodes) {
                 Ok(state) => {
                     *self.ivars().audio.borrow_mut() = Some(state);
                     self.set_error(String::new());
@@ -355,19 +274,54 @@ define_class!(
             self.begin_fade_stop();
         }
 
-        #[unsafe(method(onBackgroundClick:))]
-        fn on_background_click(&self, sender: Option<&AnyObject>) {
-            let field = &self.ivars().field;
-            if let Some(gesture) = sender.and_then(|s| s.downcast_ref::<NSGestureRecognizer>()) {
-                let p = gesture.locationInView(Some(field));
-                let b = field.bounds();
-                if p.x >= 0.0 && p.y >= 0.0 && p.x <= b.size.width && p.y <= b.size.height {
-                    return;
-                }
+        #[unsafe(method(onSearch:))]
+        fn on_search(&self, _sender: Option<&AnyObject>) {
+            let ivars = self.ivars();
+            let query = ivars.search.stringValue().to_string().to_lowercase();
+            let matches: Vec<usize> = ivars
+                .installed
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.name.to_lowercase().contains(&query))
+                .map(|(n, _)| n)
+                .collect();
+            *ivars.filtered.borrow_mut() = matches;
+            ivars.available_table.reloadData();
+        }
+
+        #[unsafe(method(onAdd:))]
+        fn on_add(&self, _sender: Option<&AnyObject>) {
+            self.add_selected();
+        }
+
+        #[unsafe(method(onAvailableDouble:))]
+        fn on_available_double(&self, _sender: Option<&AnyObject>) {
+            self.add_selected();
+        }
+
+        #[unsafe(method(onRemove:))]
+        fn on_remove(&self, _sender: Option<&AnyObject>) {
+            let ivars = self.ivars();
+            let row = ivars.chain_table.selectedRow();
+            if row < 0 {
+                return;
             }
-            if let Some(window) = field.window() {
-                window.makeFirstResponder(None);
+            let mut chain = ivars.chain.borrow_mut();
+            if (row as usize) < chain.len() {
+                chain.remove(row as usize);
             }
+            drop(chain);
+            ivars.chain_table.reloadData();
+        }
+
+        #[unsafe(method(onEdit:))]
+        fn on_edit(&self, _sender: Option<&AnyObject>) {
+            self.edit_selected();
+        }
+
+        #[unsafe(method(onChainDouble:))]
+        fn on_chain_double(&self, _sender: Option<&AnyObject>) {
+            self.edit_selected();
         }
 
         #[unsafe(method(onBrowse:))]
@@ -395,14 +349,24 @@ define_class!(
 impl AppHandler {
     fn new(
         mtm: MainThreadMarker,
-        effects: Vec<EffectCmd>,
         field: Retained<NSTextField>,
         error_label: Retained<NSTextField>,
+        search: Retained<NSSearchField>,
+        available_table: Retained<NSTableView>,
+        chain_table: Retained<NSTableView>,
     ) -> Retained<Self> {
+        let installed = list_installed_effects();
+        let filtered = (0..installed.len()).collect();
         let this = mtm.alloc::<Self>().set_ivars(AppIvars {
-            effects,
             field,
             error_label,
+            search,
+            available_table,
+            chain_table,
+            installed,
+            filtered: RefCell::new(filtered),
+            chain: RefCell::new(Vec::new()),
+            editors: RefCell::new(Vec::new()),
             audio: RefCell::new(None),
             fade: RefCell::new(None),
         });
@@ -416,6 +380,81 @@ impl AppHandler {
         label.setAlphaValue(if message.is_empty() { 0.0 } else { 1.0 });
     }
 
+    fn add_selected(&self) {
+        let ivars = self.ivars();
+        let row = ivars.available_table.selectedRow();
+        if row < 0 {
+            return;
+        }
+        let picked = ivars.filtered.borrow().get(row as usize).copied();
+        if let Some(index) = picked {
+            let desc = ivars.installed[index].desc;
+            let node: Retained<AVAudioUnitEffect> = unsafe {
+                if desc.componentSubType == u32::from_be_bytes(*b"nbeq") {
+                    Retained::into_super(AVAudioUnitEQ::initWithNumberOfBands(
+                        AVAudioUnitEQ::alloc(),
+                        4,
+                    ))
+                } else {
+                    AVAudioUnitEffect::initWithAudioComponentDescription(
+                        AVAudioUnitEffect::alloc(),
+                        desc,
+                    )
+                }
+            };
+            ivars.chain.borrow_mut().push(ChainItem { index, node });
+            ivars.chain_table.reloadData();
+        }
+    }
+
+    fn edit_selected(&self) {
+        let ivars = self.ivars();
+        let row = ivars.chain_table.selectedRow();
+        if row < 0 {
+            return;
+        }
+        let picked = ivars
+            .chain
+            .borrow()
+            .get(row as usize)
+            .map(|c| (c.node.clone(), ivars.installed[c.index].name.clone()));
+        if let Some((node, name)) = picked {
+            self.open_editor(&node, name);
+        }
+    }
+
+    fn open_editor(&self, node: &AVAudioUnitEffect, title: String) {
+        let mtm = self.mtm();
+
+        match cocoa_view(raw_audio_unit(node)) {
+            Some((view, factory)) => {
+                let window = editor_window(mtm, &view, &title);
+                self.ivars().editors.borrow_mut().push(Editor {
+                    window,
+                    factory: Some(factory),
+                });
+                self.set_error(String::new());
+            }
+            None => {
+                let view = unsafe {
+                    AUGenericView::initWithAudioUnit(
+                        mtm.alloc::<AUGenericView>(),
+                        raw_audio_unit(node) as AudioUnit,
+                    )
+                };
+
+                let window = editor_window(mtm, &view, &title);
+
+                self.ivars().editors.borrow_mut().push(Editor {
+                    window,
+                    factory: None,
+                });
+
+                self.set_error(String::new());
+            }
+        }
+    }
+
     fn finish_stop(&self) {
         if let Some(timer) = self.ivars().fade.borrow_mut().take() {
             timer.invalidate();
@@ -424,6 +463,9 @@ impl AppHandler {
             unsafe {
                 state.player.stop();
                 state.engine.stop();
+                for node in &state.nodes {
+                    state.engine.detachNode(node);
+                }
             }
         }
     }
@@ -474,7 +516,10 @@ where
     unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(FADE_TICK_SECS, true, &block) }
 }
 
-fn start_audio(file_path: &Path, effects: &[EffectCmd]) -> anyhow::Result<AudioState> {
+fn start_audio(
+    file_path: &Path,
+    nodes: Vec<Retained<AVAudioUnitEffect>>,
+) -> anyhow::Result<AudioState> {
     let url = NSURL::fileURLWithPath(&NSString::from_str(
         std::fs::canonicalize(file_path)?
             .to_str()
@@ -487,8 +532,6 @@ fn start_audio(file_path: &Path, effects: &[EffectCmd]) -> anyhow::Result<AudioS
         let engine = AVAudioEngine::new();
         let player = AVAudioPlayerNode::new();
         let mixer = engine.mainMixerNode();
-
-        let nodes: Vec<_> = effects.iter().map(|e| e.build_node()).collect();
 
         engine.attachNode(&player);
         for node in &nodes {
@@ -534,6 +577,33 @@ fn make_stack(
     stack
 }
 
+fn make_list(
+    height: f64,
+    mtm: MainThreadMarker,
+) -> (Retained<NSScrollView>, Retained<NSTableView>) {
+    let table = NSTableView::new(mtm);
+    let column =
+        NSTableColumn::initWithIdentifier(mtm.alloc::<NSTableColumn>(), ns_string!("name"));
+    column.setResizingMask(NSTableColumnResizingOptions::AutoresizingMask);
+    table.addTableColumn(&column);
+    table.setHeaderView(None);
+    table.setColumnAutoresizingStyle(
+        NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
+    );
+    table.setAllowsEmptySelection(true);
+    table.setAllowsMultipleSelection(false);
+
+    let scroll = NSScrollView::new(mtm);
+    scroll.setDocumentView(Some(&table));
+    scroll.setHasVerticalScroller(true);
+    scroll.setBorderType(NSBorderType::BezelBorder);
+    scroll
+        .heightAnchor()
+        .constraintEqualToConstant(height)
+        .setActive(true);
+    (scroll, table)
+}
+
 fn make_error_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
     let label = NSTextField::textFieldWithString(&NSString::new(), mtm);
     label.setEditable(false);
@@ -549,20 +619,51 @@ fn make_error_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
     label
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn padded_tab_content(view: &NSView, inset: f64, mtm: MainThreadMarker) -> Retained<NSView> {
+    let container = NSView::new(mtm);
 
+    view.setTranslatesAutoresizingMaskIntoConstraints(false);
+    container.addSubview(view);
+
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        view.leadingAnchor()
+            .constraintEqualToAnchor_constant(&container.leadingAnchor(), inset),
+        view.trailingAnchor()
+            .constraintEqualToAnchor_constant(&container.trailingAnchor(), -inset),
+        view.topAnchor()
+            .constraintEqualToAnchor_constant(&container.topAnchor(), inset),
+        view.bottomAnchor()
+            .constraintEqualToAnchor_constant(&container.bottomAnchor(), -inset),
+    ]));
+
+    container
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "KqBackgroundView"]
+    struct BackgroundView;
+
+    impl BackgroundView {
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            if let Some(window) = self.window() {
+                window.makeFirstResponder(None);
+            }
+        }
+    }
+);
+
+fn main() {
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     NSWindow::setAllowsAutomaticWindowTabbing(false, mtm);
 
-    let initial = cli
-        .file
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let field = NSTextField::textFieldWithString(&NSString::from_str(&initial), mtm);
+    let field = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    field.setEditable(true);
+    field.setSelectable(true);
     field.setPlaceholderString(Some(ns_string!("Path to an audio file")));
     if field.respondsToSelector(sel!(setAllowsWritingTools:)) {
         field.setAllowsWritingTools(false);
@@ -571,11 +672,37 @@ fn main() {
         field.setAllowsWritingToolsAffordance(false);
     }
 
-    let error_label = make_error_label(mtm);
-    let handler = AppHandler::new(mtm, cli.effect, field.clone(), error_label.clone());
-    app.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
+    let search = NSSearchField::new(mtm);
+    search.setEditable(true);
+    search.setSelectable(true);
+    search.setPlaceholderString(Some(ns_string!("Search installed effects")));
+    search.setSendsSearchStringImmediately(true);
 
-    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 160.0));
+    let (available_scroll, available_table) = make_list(150.0, mtm);
+    let (chain_scroll, chain_table) = make_list(150.0, mtm);
+
+    let error_label = make_error_label(mtm);
+    let handler = AppHandler::new(
+        mtm,
+        field.clone(),
+        error_label.clone(),
+        search.clone(),
+        available_table.clone(),
+        chain_table.clone(),
+    );
+    app.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
+    unsafe {
+        available_table.setDataSource(Some(ProtocolObject::from_ref(&*handler)));
+        chain_table.setDataSource(Some(ProtocolObject::from_ref(&*handler)));
+        available_table.setTarget(Some(&handler));
+        available_table.setDoubleAction(Some(sel!(onAvailableDouble:)));
+        chain_table.setTarget(Some(&handler));
+        chain_table.setDoubleAction(Some(sel!(onChainDouble:)));
+        search.setTarget(Some(&handler));
+        search.setAction(Some(sel!(onSearch:)));
+    }
+
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 380.0));
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Miniaturizable
@@ -593,22 +720,42 @@ fn main() {
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTabbingMode(NSWindowTabbingMode::Disallowed);
     window.setTitle(ns_string!("kq"));
-    window.setContentMinSize(NSSize::new(360.0, 120.0));
+    window.setContentMinSize(NSSize::new(560.0, 340.0));
 
     let browse_btn = make_button(ns_string!("Browse…"), &handler, sel!(onBrowse:), mtm);
     let play_btn = make_button(ns_string!("Play"), &handler, sel!(onPlay:), mtm);
     let stop_btn = make_button(ns_string!("Stop"), &handler, sel!(onStop:), mtm);
+    let add_btn = make_button(ns_string!("+"), &handler, sel!(onAdd:), mtm);
+    let remove_btn = make_button(ns_string!("−"), &handler, sel!(onRemove:), mtm);
+    let edit_btn = make_button(ns_string!("Edit"), &handler, sel!(onEdit:), mtm);
+
     play_btn.setKeyEquivalent(ns_string!(" "));
     stop_btn.setKeyEquivalent(ns_string!("\u{1b}"));
 
     let file_row = make_stack(
         &[
-            Retained::into_super(Retained::into_super(field)),
+            Retained::into_super(Retained::into_super(field.clone())),
             Retained::into_super(Retained::into_super(browse_btn)),
         ],
         NSStackViewDistribution::Fill,
         mtm,
     );
+
+    let cname_field = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    cname_field.setPlaceholderString(Some(ns_string!("Cue Name")));
+
+    let cid_field = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    cid_field.setPlaceholderString(Some(ns_string!("Cue ID")));
+
+    let metadata_row = make_stack(
+        &[
+            Retained::into_super(Retained::into_super(cid_field.clone())),
+            Retained::into_super(Retained::into_super(cname_field.clone())),
+        ],
+        NSStackViewDistribution::FillEqually,
+        mtm,
+    );
+
     let button_row = make_stack(
         &[
             Retained::into_super(Retained::into_super(play_btn)),
@@ -617,10 +764,138 @@ fn main() {
         NSStackViewDistribution::FillEqually,
         mtm,
     );
+
+    let edit_row = make_stack(
+        &[
+            Retained::into_super(Retained::into_super(add_btn)),
+            Retained::into_super(Retained::into_super(remove_btn)),
+            Retained::into_super(Retained::into_super(edit_btn)),
+        ],
+        NSStackViewDistribution::FillEqually,
+        mtm,
+    );
+
+    let left_col = make_stack(
+        &[
+            Retained::into_super(Retained::into_super(Retained::into_super(search.clone()))),
+            Retained::into_super(available_scroll.clone()),
+        ],
+        NSStackViewDistribution::Fill,
+        mtm,
+    );
+    left_col.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+
+    let right_col = make_stack(
+        &[
+            Retained::into_super(edit_row.clone()),
+            Retained::into_super(chain_scroll.clone()),
+        ],
+        NSStackViewDistribution::Fill,
+        mtm,
+    );
+    right_col.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+
+    let columns = make_stack(
+        &[
+            Retained::into_super(left_col.clone()),
+            Retained::into_super(right_col.clone()),
+        ],
+        NSStackViewDistribution::FillEqually,
+        mtm,
+    );
+    columns.setSpacing(16.0);
+
+    let description_text = NSTextView::new(mtm);
+    description_text.setFrameSize(NSSize::new(500.0, 500.0));
+    description_text.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+    description_text.setEditable(true);
+    description_text.setSelectable(true);
+    description_text.setRichText(false);
+    description_text.setHorizontallyResizable(false);
+    description_text.setVerticallyResizable(true);
+    description_text.setMinSize(NSSize::new(0.0, 0.0));
+    description_text.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
+    description_text.setTextContainerInset(NSSize::new(8.0, 8.0));
+    description_text.setString(&NSString::new());
+
+    let text_container = unsafe { description_text.textContainer().unwrap() };
+    text_container.setWidthTracksTextView(true);
+    text_container.setContainerSize(NSSize::new(f64::MAX, f64::MAX));
+
+    let description_scroll = NSScrollView::new(mtm);
+    description_scroll.setDocumentView(Some(&description_text));
+    description_scroll.setHasVerticalScroller(true);
+    description_scroll.setHasHorizontalScroller(false);
+    description_scroll.setBorderType(NSBorderType::BezelBorder);
+    description_scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let description_content = NSView::new(mtm);
+    description_content.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    file_row.setTranslatesAutoresizingMaskIntoConstraints(false);
+    metadata_row.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    description_content.addSubview(&file_row);
+    description_content.addSubview(&metadata_row);
+    description_content.addSubview(&description_scroll);
+
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        file_row
+            .leadingAnchor()
+            .constraintEqualToAnchor(&description_content.leadingAnchor()),
+        file_row
+            .trailingAnchor()
+            .constraintEqualToAnchor(&description_content.trailingAnchor()),
+        file_row
+            .topAnchor()
+            .constraintEqualToAnchor(&description_content.topAnchor()),
+        file_row.heightAnchor().constraintEqualToConstant(28.0),
+        metadata_row
+            .leadingAnchor()
+            .constraintEqualToAnchor(&description_content.leadingAnchor()),
+        metadata_row
+            .trailingAnchor()
+            .constraintEqualToAnchor(&description_content.trailingAnchor()),
+        metadata_row
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&file_row.bottomAnchor(), 12.0),
+        metadata_row.heightAnchor().constraintEqualToConstant(28.0),
+        description_scroll
+            .leadingAnchor()
+            .constraintEqualToAnchor(&description_content.leadingAnchor()),
+        description_scroll
+            .trailingAnchor()
+            .constraintEqualToAnchor(&description_content.trailingAnchor()),
+        description_scroll
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&metadata_row.bottomAnchor(), 12.0),
+        description_scroll
+            .bottomAnchor()
+            .constraintEqualToAnchor(&description_content.bottomAnchor()),
+        cid_field
+            .widthAnchor()
+            .constraintEqualToAnchor_multiplier(&cname_field.widthAnchor(), 0.2),
+    ]));
+
+    let description_tab_content = padded_tab_content(&description_content, 16.0, mtm);
+    let filters_tab_content = padded_tab_content(&columns, 16.0, mtm);
+
+    let description_tab = NSTabViewItem::new();
+    description_tab.setLabel(ns_string!("Info"));
+    description_tab.setView(Some(&description_tab_content));
+
+    let filters_tab = NSTabViewItem::new();
+    filters_tab.setLabel(ns_string!("Filters"));
+    filters_tab.setView(Some(&filters_tab_content));
+
+    let tabs = NSTabView::new(mtm);
+    tabs.addTabViewItem(&description_tab);
+    tabs.addTabViewItem(&filters_tab);
+
     let root = make_stack(
         &[
-            Retained::into_super(file_row.clone()),
             Retained::into_super(button_row.clone()),
+            Retained::into_super(tabs.clone()),
             Retained::into_super(Retained::into_super(error_label.clone())),
         ],
         NSStackViewDistribution::Fill,
@@ -630,7 +905,12 @@ fn main() {
     root.setSpacing(14.0);
     root.setTranslatesAutoresizingMaskIntoConstraints(false);
 
-    let content = window.contentView().unwrap();
+    let background: Retained<BackgroundView> =
+        unsafe { msg_send![mtm.alloc::<BackgroundView>(), init] };
+
+    window.setContentView(Some(&background));
+
+    let content: &NSView = &background;
     content.addSubview(&root);
 
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
@@ -640,30 +920,30 @@ fn main() {
             .constraintEqualToAnchor(&content.centerYAnchor()),
         root.widthAnchor()
             .constraintEqualToAnchor_multiplier(&content.widthAnchor(), 0.85),
-        file_row
-            .widthAnchor()
-            .constraintEqualToAnchor(&root.widthAnchor()),
         button_row
             .widthAnchor()
             .constraintEqualToAnchor(&root.widthAnchor()),
+        tabs.widthAnchor()
+            .constraintEqualToAnchor(&root.widthAnchor()),
+        tabs.heightAnchor().constraintEqualToConstant(260.0),
         error_label
             .widthAnchor()
             .constraintEqualToAnchor(&root.widthAnchor()),
         error_label.heightAnchor().constraintEqualToConstant(36.0),
     ]));
 
-    let click = unsafe {
-        NSClickGestureRecognizer::initWithTarget_action(
-            mtm.alloc::<NSClickGestureRecognizer>(),
-            Some(&handler),
-            Some(sel!(onBackgroundClick:)),
-        )
-    };
-    content.addGestureRecognizer(&click);
+    content.layoutSubtreeIfNeeded();
+    tabs.layoutSubtreeIfNeeded();
+    columns.layoutSubtreeIfNeeded();
+    description_content.layoutSubtreeIfNeeded();
 
     window.center();
     window.makeKeyAndOrderFront(None);
-    window.makeFirstResponder(None);
+
+    content.layoutSubtreeIfNeeded();
+    tabs.layoutSubtreeIfNeeded();
+    columns.layoutSubtreeIfNeeded();
+    description_content.layoutSubtreeIfNeeded();
 
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
