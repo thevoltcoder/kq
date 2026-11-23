@@ -184,6 +184,7 @@ pub fn start_audio(
             engine,
             player,
             nodes,
+            matrix: None,
         })
     }
 }
@@ -235,6 +236,57 @@ pub fn make_list(
     (scroll, table)
 }
 
+pub fn make_faderslider(
+    mtm: MainThreadMarker,
+    label: &str,
+    on_change: Option<Box<dyn Fn(f64)>>,
+) -> (
+    Retained<NSView>,
+    Retained<NSSlider>,
+    Retained<NSTextField>,
+    Retained<custom::FaderSlider>,
+) {
+    let controller = custom::FaderSlider::new(mtm);
+
+    let container = NSView::initWithFrame(
+        mtm.alloc(),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(70.0, 150.0)),
+    );
+    container.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let label_view = NSTextField::labelWithString(&NSString::from_str(label), mtm);
+    label_view.setFrame(NSRect::new(NSPoint::new(5.0, 0.0), NSSize::new(60.0, 14.0)));
+    label_view.setAlignment(NSTextAlignment::Center);
+    label_view.setControlSize(NSControlSize::Small);
+
+    let tf_frame = NSRect::new(NSPoint::new(10.0, 16.0), NSSize::new(50.0, 20.0));
+    let text_field = NSTextField::initWithFrame(mtm.alloc(), tf_frame);
+    text_field.setAlignment(NSTextAlignment::Center);
+
+    let slider_frame = NSRect::new(NSPoint::new(23.0, 46.0), NSSize::new(24.0, 100.0));
+    let slider = NSSlider::initWithFrame(mtm.alloc(), slider_frame);
+    slider.setMinValue(-80.0);
+    slider.setMaxValue(24.0);
+    slider.setDoubleValue(0.0);
+
+    container.addSubview(&label_view);
+    container.addSubview(&text_field);
+    container.addSubview(&slider);
+
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        container.widthAnchor().constraintEqualToConstant(70.0),
+        container.heightAnchor().constraintEqualToConstant(150.0),
+    ]));
+
+    controller.attach(slider.clone(), text_field.clone());
+
+    if let Some(cb) = on_change {
+        controller.set_on_change(cb);
+    }
+
+    (container, slider, text_field, controller)
+}
+
 pub fn make_error_label(mtm: MainThreadMarker) -> Retained<NSTextField> {
     let label = NSTextField::textFieldWithString(&NSString::new(), mtm);
     label.setEditable(false);
@@ -268,4 +320,18 @@ pub fn padded_tab_content(view: &NSView, inset: f64, mtm: MainThreadMarker) -> R
     ]));
 
     container
+}
+
+pub fn set_matrix_gain(unit: &AVAudioUnit, input: u32, output: u32, lin: f32) {
+    let element = (input << 16) | output;
+    unsafe {
+        AudioUnitSetParameter(
+            unit.audioUnit() as AudioUnit,
+            0, // kMatrixMixerParam_Volume
+            kAudioUnitScope_Global,
+            element,
+            lin,
+            0,
+        );
+    }
 }

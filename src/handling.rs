@@ -33,6 +33,7 @@ pub struct AudioState {
     pub engine: Retained<AVAudioEngine>,
     pub player: Retained<AVAudioPlayerNode>,
     pub nodes: Vec<Retained<AVAudioUnitEffect>>,
+    pub matrix: Option<Retained<AVAudioUnit>>,
 }
 
 pub struct AppIvars {
@@ -47,6 +48,9 @@ pub struct AppIvars {
     pub editors: RefCell<Vec<Editor>>,
     pub audio: RefCell<Option<AudioState>>,
     pub fade: RefCell<Option<Retained<NSTimer>>>,
+    pub gain: Cell<f32>,
+    pub gain_l: Cell<f32>,
+    pub gain_r: Cell<f32>,
 }
 
 define_class!(
@@ -125,6 +129,7 @@ define_class!(
             match helpers::start_audio(&path, nodes) {
                 Ok(state) => {
                     *self.ivars().audio.borrow_mut() = Some(state);
+                    self.apply_gain();
                     self.set_error(String::new());
                 }
                 Err(e) => self.set_error(e.to_string()),
@@ -231,9 +236,60 @@ impl AppHandler {
             editors: RefCell::new(Vec::new()),
             audio: RefCell::new(None),
             fade: RefCell::new(None),
+            gain: Cell::new(1.0),
+            gain_l: Cell::new(1.0),
+            gain_r: Cell::new(1.0),
         });
 
         unsafe { msg_send![super(this), init] }
+    }
+
+    pub fn set_gain(&self, db: f64) {
+        let lin = if db <= -79.9 {
+            0.0
+        } else {
+            10f32.powf(db as f32 / 20.0)
+        };
+        self.ivars().gain.set(lin);
+        self.apply_gain();
+    }
+
+    fn db_to_lin(db: f64) -> f32 {
+        if db <= -79.9 {
+            0.0
+        } else {
+            10f32.powf(db as f32 / 20.0)
+        }
+    }
+
+    pub fn set_gain_l(&self, db: f64) {
+        self.ivars().gain_l.set(Self::db_to_lin(db));
+        self.apply_channel_gains();
+    }
+
+    pub fn set_gain_r(&self, db: f64) {
+        self.ivars().gain_r.set(Self::db_to_lin(db));
+        self.apply_channel_gains();
+    }
+
+    fn apply_channel_gains(&self) {
+        let l = self.ivars().gain_l.get();
+        let r = self.ivars().gain_r.get();
+        if let Some(state) = self.ivars().audio.borrow().as_ref() {
+            if let Some(matrix) = state.matrix.as_ref() {
+                helpers::set_matrix_gain(matrix, 0, 0, l);
+                helpers::set_matrix_gain(matrix, 1, 1, r);
+            }
+        }
+    }
+
+    fn apply_gain(&self) {
+        let gain = self.ivars().gain.get();
+        if let Some(state) = self.ivars().audio.borrow().as_ref() {
+            unsafe {
+                state.engine.mainMixerNode().setOutputVolume(gain);
+            }
+        }
     }
 
     pub fn set_error(&self, message: String) {

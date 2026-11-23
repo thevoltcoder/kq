@@ -184,6 +184,42 @@ fn main() {
     description_content.addSubview(&metadata_row);
     description_content.addSubview(&description_scroll);
 
+    let levels_content = NSView::new(mtm);
+    levels_content.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let gain_handler = handler.clone();
+    let (gain_box, _gain_slider, _gain_field, _fs_gain) = helpers::make_faderslider(
+        mtm,
+        "Gain",
+        Some(Box::new(move |db| gain_handler.set_gain(db))),
+    );
+
+    let hl = handler.clone();
+    let (l_box, _l_slider, _l_field, _fs_l) =
+        helpers::make_faderslider(mtm, "L", Some(Box::new(move |db| hl.set_gain_l(db))));
+
+    let hr = handler.clone();
+    let (r_box, _r_slider, _r_field, _fs_r) =
+        helpers::make_faderslider(mtm, "R", Some(Box::new(move |db| hr.set_gain_r(db))));
+
+    let faders_row = make_stack(
+        &[gain_box, l_box, r_box],
+        NSStackViewDistribution::Fill,
+        mtm,
+    );
+    faders_row.setSpacing(16.0);
+    faders_row.setTranslatesAutoresizingMaskIntoConstraints(false);
+    levels_content.addSubview(&faders_row);
+
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        faders_row
+            .leadingAnchor()
+            .constraintEqualToAnchor(&levels_content.leadingAnchor()),
+        faders_row
+            .topAnchor()
+            .constraintEqualToAnchor(&levels_content.topAnchor()),
+    ]));
+
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
         file_row
             .leadingAnchor()
@@ -223,11 +259,16 @@ fn main() {
     ]));
 
     let description_tab_content = padded_tab_content(&description_content, 16.0, mtm);
+    let levels_tab_content = padded_tab_content(&levels_content, 16.0, mtm);
     let filters_tab_content = padded_tab_content(&columns, 16.0, mtm);
 
     let description_tab = NSTabViewItem::new();
     description_tab.setLabel(ns_string!("Info"));
     description_tab.setView(Some(&description_tab_content));
+
+    let levels_tab = NSTabViewItem::new();
+    levels_tab.setLabel(ns_string!("Levels"));
+    levels_tab.setView(Some(&levels_tab_content));
 
     let filters_tab = NSTabViewItem::new();
     filters_tab.setLabel(ns_string!("Filters"));
@@ -235,6 +276,7 @@ fn main() {
 
     let tabs = NSTabView::new(mtm);
     tabs.addTabViewItem(&description_tab);
+    tabs.addTabViewItem(&levels_tab);
     tabs.addTabViewItem(&filters_tab);
 
     let root = make_stack(
