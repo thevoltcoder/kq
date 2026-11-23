@@ -33,6 +33,7 @@ pub struct AudioState {
     pub engine: Retained<AVAudioEngine>,
     pub player: Retained<AVAudioPlayerNode>,
     pub nodes: Vec<Retained<AVAudioUnitEffect>>,
+    pub fade_mixer: Retained<AVAudioMixerNode>,
     pub matrix: Option<Retained<AVAudioUnit>>,
 }
 
@@ -130,6 +131,7 @@ define_class!(
                 Ok(state) => {
                     *self.ivars().audio.borrow_mut() = Some(state);
                     self.apply_gain();
+                    self.apply_channel_gains();
                     self.set_error(String::new());
                 }
                 Err(e) => self.set_error(e.to_string()),
@@ -179,6 +181,7 @@ define_class!(
             }
             drop(chain);
             ivars.chain_table.reloadData();
+            self.rewire();
         }
 
         #[unsafe(method(onEdit:))]
@@ -244,22 +247,17 @@ impl AppHandler {
         unsafe { msg_send![super(this), init] }
     }
 
-    pub fn set_gain(&self, db: f64) {
-        let lin = if db <= -79.9 {
-            0.0
-        } else {
-            10f32.powf(db as f32 / 20.0)
-        };
-        self.ivars().gain.set(lin);
-        self.apply_gain();
-    }
-
     fn db_to_lin(db: f64) -> f32 {
         if db <= -79.9 {
             0.0
         } else {
             10f32.powf(db as f32 / 20.0)
         }
+    }
+
+    pub fn set_gain(&self, db: f64) {
+        self.ivars().gain.set(Self::db_to_lin(db));
+        self.apply_gain();
     }
 
     pub fn set_gain_l(&self, db: f64) {
@@ -322,6 +320,7 @@ impl AppHandler {
             };
             ivars.chain.borrow_mut().push(ChainItem { index, node });
             ivars.chain_table.reloadData();
+            self.rewire();
         }
     }
 
@@ -384,6 +383,9 @@ impl AppHandler {
                 for node in &state.nodes {
                     state.engine.detachNode(node);
                 }
+                if let Some(matrix) = &state.matrix {
+                    state.engine.detachNode(matrix);
+                }
             }
         }
     }
@@ -405,6 +407,19 @@ impl AppHandler {
         let this = self.retain();
         let timer = helpers::fade_out(player, move || this.finish_stop());
         *self.ivars().fade.borrow_mut() = Some(timer);
+    }
+
+    fn rewire(&self) {
+        let nodes: Vec<Retained<AVAudioUnitEffect>> = self
+            .ivars()
+            .chain
+            .borrow()
+            .iter()
+            .map(|c| c.node.clone())
+            .collect();
+        if let Some(state) = self.ivars().audio.borrow_mut().as_mut() {
+            helpers::rewire(state, nodes);
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn raw_audio_unit(node: &AVAudioUnitEffect) -> *mut handling::RawAudioUnit {
+pub fn raw_audio_unit(node: &AVAudioUnit) -> *mut handling::RawAudioUnit {
     unsafe { msg_send![node, audioUnit] }
 }
 
@@ -147,6 +147,49 @@ where
     unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(FADE_TICK_SECS, true, &block) }
 }
 
+pub fn set_matrix_gain(unit: &AVAudioUnit, input: u32, output: u32, lin: f32) {
+    let element = (input << 16) | output;
+    unsafe {
+        let status = AudioUnitSetParameter(
+            raw_audio_unit(unit) as AudioUnit,
+            0,
+            kAudioUnitScope_Global,
+            element,
+            lin,
+            0,
+        );
+        if status != 0 {
+            eprintln!("matrix gain {input}->{output} failed: {status}");
+        }
+    }
+}
+
+fn init_matrix_volumes(unit: &AVAudioUnit) {
+    unsafe {
+        let au = raw_audio_unit(unit) as AudioUnit;
+        let set = |scope: u32, element: u32, value: f32| {
+            let status = AudioUnitSetParameter(au, 0, scope, element, value, 0);
+            if status != 0 {
+                eprintln!("matrix volume scope {scope} element {element} failed: {status}");
+            }
+        };
+        set(kAudioUnitScope_Global, 0xFFFF_FFFF, 1.0);
+        for ch in 0..2u32 {
+            set(kAudioUnitScope_Input, ch, 1.0);
+            set(kAudioUnitScope_Output, ch, 1.0);
+        }
+        for i in 0..2u32 {
+            for o in 0..2u32 {
+                set(
+                    kAudioUnitScope_Global,
+                    (i << 16) | o,
+                    if i == o { 1.0 } else { 0.0 },
+                );
+            }
+        }
+    }
+}
+
 pub fn start_audio(
     file_path: &Path,
     nodes: Vec<Retained<AVAudioUnitEffect>>,
@@ -163,30 +206,110 @@ pub fn start_audio(
         let engine = AVAudioEngine::new();
         let player = AVAudioPlayerNode::new();
         let mixer = engine.mainMixerNode();
+        let fade_mixer = AVAudioMixerNode::new();
+        let matrix = make_matrix_mixer();
+
+        if matrix.is_none() {
+            eprintln!("matrix mixer could not be instantiated");
+        }
 
         engine.attachNode(&player);
+        engine.attachNode(&fade_mixer);
         for node in &nodes {
             engine.attachNode(node);
         }
+        if let Some(m) = &matrix {
+            engine.attachNode(m);
+        }
 
-        let mut prev: &AVAudioNode = &player;
+        engine.connect_to_format(&player, &fade_mixer, Some(&fmt));
+
+        let mut prev: &AVAudioNode = &fade_mixer;
         for node in &nodes {
             engine.connect_to_format(prev, node, Some(&fmt));
             prev = node;
         }
-        engine.connect_to_format(prev, &mixer, Some(&fmt));
+        match &matrix {
+            Some(m) => {
+                engine.connect_to_format(prev, m, Some(&fmt));
+                engine.connect_to_format(m, &mixer, Some(&fmt));
+            }
+            None => engine.connect_to_format(prev, &mixer, Some(&fmt)),
+        }
 
         player.scheduleFile_atTime_completionHandler(&file, None, std::ptr::null_mut());
         engine.startAndReturnError()?;
+        if let Some(m) = &matrix {
+            init_matrix_volumes(m);
+        }
         player.play();
 
         Ok(handling::AudioState {
             engine,
             player,
             nodes,
-            matrix: None,
+            fade_mixer,
+            matrix,
         })
     }
+}
+
+pub fn rewire(state: &mut handling::AudioState, nodes: Vec<Retained<AVAudioUnitEffect>>) {
+    unsafe {
+        let fmt = state.fade_mixer.outputFormatForBus(0);
+        let same = |a: &Retained<AVAudioUnitEffect>, b: &Retained<AVAudioUnitEffect>| {
+            Retained::as_ptr(a) == Retained::as_ptr(b)
+        };
+        for old in &state.nodes {
+            if !nodes.iter().any(|n| same(n, old)) {
+                state.engine.detachNode(old);
+            }
+        }
+        for node in &nodes {
+            if !state.nodes.iter().any(|o| same(o, node)) {
+                state.engine.attachNode(node);
+            }
+        }
+        let mut prev: &AVAudioNode = &state.fade_mixer;
+        for node in &nodes {
+            state.engine.connect_to_format(prev, node, Some(&fmt));
+            prev = node;
+        }
+        match &state.matrix {
+            Some(m) => state.engine.connect_to_format(prev, m, Some(&fmt)),
+            None => {
+                let main = state.engine.mainMixerNode();
+                state.engine.connect_to_format(prev, &main, Some(&fmt));
+            }
+        }
+        state.nodes = nodes;
+    }
+}
+
+struct SendUnit(Option<Retained<AVAudioUnit>>);
+unsafe impl Send for SendUnit {}
+
+fn make_matrix_mixer() -> Option<Retained<AVAudioUnit>> {
+    let desc = AudioComponentDescription {
+        componentType: u32::from_be_bytes(*b"aumx"),
+        componentSubType: u32::from_be_bytes(*b"mxmx"),
+        componentManufacturer: u32::from_be_bytes(*b"appl"),
+        componentFlags: 0,
+        componentFlagsMask: 0,
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<SendUnit>();
+    let block = RcBlock::new(move |unit: *mut AVAudioUnit, _err: *mut NSError| {
+        let retained = unsafe { Retained::retain(unit) };
+        let _ = tx.send(SendUnit(retained));
+    });
+    unsafe {
+        AVAudioUnit::instantiateWithComponentDescription_options_completionHandler(
+            desc,
+            AudioComponentInstantiationOptions(0),
+            &block,
+        );
+    }
+    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()?.0
 }
 
 pub fn make_button(
@@ -320,18 +443,4 @@ pub fn padded_tab_content(view: &NSView, inset: f64, mtm: MainThreadMarker) -> R
     ]));
 
     container
-}
-
-pub fn set_matrix_gain(unit: &AVAudioUnit, input: u32, output: u32, lin: f32) {
-    let element = (input << 16) | output;
-    unsafe {
-        AudioUnitSetParameter(
-            unit.audioUnit() as AudioUnit,
-            0, // kMatrixMixerParam_Volume
-            kAudioUnitScope_Global,
-            element,
-            lin,
-            0,
-        );
-    }
 }
