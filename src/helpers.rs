@@ -147,169 +147,257 @@ where
     unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(FADE_TICK_SECS, true, &block) }
 }
 
-pub fn set_matrix_gain(unit: &AVAudioUnit, input: u32, output: u32, lin: f32) {
-    let element = (input << 16) | output;
+pub fn instantiate_builtin_eq() -> Retained<AVAudioUnitEffect> {
     unsafe {
-        let status = AudioUnitSetParameter(
-            raw_audio_unit(unit) as AudioUnit,
-            0,
-            kAudioUnitScope_Global,
-            element,
-            lin,
-            0,
+        Retained::into_super(AVAudioUnitEQ::initWithNumberOfBands(
+            AVAudioUnitEQ::alloc(),
+            4,
+        ))
+    }
+}
+
+pub fn instantiate_effect_async(
+    desc: AudioComponentDescription,
+    index: usize,
+    tx: std::sync::mpsc::Sender<(usize, Result<usize, String>)>,
+) {
+    let block = RcBlock::new(move |unit: *mut AVAudioUnit, error: *mut NSError| {
+        let result = if !unit.is_null() {
+            match unsafe { Retained::<AVAudioUnit>::retain(unit) } {
+                Some(unit) => Ok(Retained::into_raw(unit) as usize),
+                None => Err("Failed to retain instantiated Audio Unit".to_string()),
+            }
+        } else {
+            let message = if error.is_null() {
+                "Audio Unit instantiation failed without an NSError".to_string()
+            } else {
+                unsafe { (&*error).localizedDescription().to_string() }
+            };
+
+            Err(message)
+        };
+
+        let _ = tx.send((index, result));
+    });
+
+    unsafe {
+        AVAudioUnit::instantiateWithComponentDescription_options_completionHandler(
+            desc,
+            AudioComponentInstantiationOptions::empty(),
+            &block,
         );
-        if status != 0 {
-            eprintln!("matrix gain {input}->{output} failed: {status}");
+    }
+}
+
+fn schedule_from(state: &handling::AudioState, frame: i64) -> i64 {
+    unsafe {
+        let length = state.file.length();
+        let frame = if frame >= length { 0 } else { frame.max(0) };
+        state
+            .player
+            .scheduleSegment_startingFrame_frameCount_atTime_completionHandler(
+                &state.file,
+                frame,
+                (length - frame) as u32,
+                None,
+                null_mut(),
+            );
+        frame
+    }
+}
+
+pub fn current_frame(state: &handling::AudioState) -> i64 {
+    unsafe {
+        let Some(node_time) = state.player.lastRenderTime() else {
+            return state.start_frame;
+        };
+        let Some(player_time) = state.player.playerTimeForNodeTime(&node_time) else {
+            return state.start_frame;
+        };
+        state.start_frame + player_time.sampleTime().max(0)
+    }
+}
+
+fn connect_chain(state: &mut handling::AudioState, slots: &[handling::Slot]) {
+    unsafe {
+        let mut next: Vec<(usize, Retained<AVAudioUnitEffect>)> = Vec::new();
+        for (index, effect, on) in slots {
+            let already = state.chain.iter().any(|(i, _)| i == index);
+            if !already {
+                state.engine.attachNode(&**effect);
+            }
+            effect.setBypass(!*on);
+            next.push((*index, effect.clone()));
+        }
+        state.chain = next;
+
+        let source: &AVAudioNode = &state.pre_mixer;
+        let output: &AVAudioNode = &state.fade_mixer;
+        let mut nodes: Vec<&AVAudioNode> = vec![source];
+        for (_, effect) in &state.chain {
+            nodes.push(&**effect);
+        }
+        nodes.push(output);
+        for pair in nodes.windows(2) {
+            state
+                .engine
+                .connect_to_format(pair[0], pair[1], Some(&state.format));
         }
     }
 }
 
-fn init_matrix_volumes(unit: &AVAudioUnit) {
+pub fn insert_effect(
+    state: &mut handling::AudioState,
+    index: usize,
+    effect: &Retained<AVAudioUnitEffect>,
+    on: bool,
+) {
+    if state.chain.iter().any(|(i, _)| *i == index) {
+        return;
+    }
+
     unsafe {
-        let au = raw_audio_unit(unit) as AudioUnit;
-        let set = |scope: u32, element: u32, value: f32| {
-            let status = AudioUnitSetParameter(au, 0, scope, element, value, 0);
-            if status != 0 {
-                eprintln!("matrix volume scope {scope} element {element} failed: {status}");
-            }
+        effect.setBypass(!on);
+        state.engine.attachNode(&**effect);
+
+        let node: &AVAudioNode = &**effect;
+        let mixer: &AVAudioNode = &state.fade_mixer;
+        let pre: &AVAudioNode = &state.pre_mixer;
+        let upstream: &AVAudioNode = match state.chain.last() {
+            Some((_, last)) => &**last,
+            None => pre,
         };
-        set(kAudioUnitScope_Global, 0xFFFF_FFFF, 1.0);
-        for ch in 0..2u32 {
-            set(kAudioUnitScope_Input, ch, 1.0);
-            set(kAudioUnitScope_Output, ch, 1.0);
-        }
-        for i in 0..2u32 {
-            for o in 0..2u32 {
-                set(
-                    kAudioUnitScope_Global,
-                    (i << 16) | o,
-                    if i == o { 1.0 } else { 0.0 },
-                );
-            }
+
+        let format = state.format.clone();
+
+        state.engine.disconnectNodeOutput(upstream);
+        state
+            .engine
+            .connect_to_format(upstream, node, Some(&format));
+        state.engine.connect_to_format(node, mixer, Some(&format));
+
+        println!(
+            "after connect: up={:?} fx_in={:?} fx_out={:?} running={} playing={}",
+            format,
+            node.inputFormatForBus(0),
+            node.outputFormatForBus(0),
+            state.engine.isRunning(),
+            state.player.isPlaying()
+        );
+    }
+
+    state.chain.push((index, effect.clone()));
+}
+
+pub fn set_effect_enabled(state: &handling::AudioState, index: usize, enabled: bool) {
+    if let Some((_, effect)) = state
+        .chain
+        .iter()
+        .find(|(effect_index, _)| *effect_index == index)
+    {
+        unsafe {
+            effect.setBypass(!enabled);
         }
     }
+}
+
+pub fn teardown(state: &handling::AudioState) {
+    unsafe {
+        state.player.stop();
+        state.engine.stop();
+        for (_, effect) in &state.chain {
+            state.engine.detachNode(effect);
+        }
+        state.engine.detachNode(&state.fade_mixer);
+        state.engine.detachNode(&state.player);
+        state.engine.detachNode(&state.pre_mixer);
+    }
+}
+
+fn open_audio_file(file_path: &Path) -> anyhow::Result<Retained<AVAudioFile>> {
+    let url = NSURL::from_file_path(file_path).context("invalid audio file path")?;
+    let allocated = AVAudioFile::alloc();
+    let mut error: *mut NSError = std::ptr::null_mut();
+    let file: Option<Retained<AVAudioFile>> =
+        unsafe { msg_send![allocated, initForReading: &*url, error: &mut error] };
+    println!(
+        "{:#?}",
+        file.clone().map(|f| unsafe { f.processingFormat() })
+    );
+    file.ok_or_else(|| anyhow::anyhow!("Failed to open audio file: {:?}", error))
+}
+
+pub fn play_audio(
+    state: &mut handling::AudioState,
+    file_path: &Path,
+    start_frame: i64,
+) -> anyhow::Result<()> {
+    let file = open_audio_file(file_path)?;
+    unsafe {
+        state.player.stop();
+    }
+    state.file = file;
+    state.path = file_path.to_path_buf();
+    state.start_frame = schedule_from(state, start_frame);
+    unsafe {
+        state.player.play();
+    }
+    Ok(())
 }
 
 pub fn start_audio(
     file_path: &Path,
-    nodes: Vec<Retained<AVAudioUnitEffect>>,
+    slots: &[handling::Slot],
+    start_frame: i64,
 ) -> anyhow::Result<handling::AudioState> {
-    let url = NSURL::fileURLWithPath(&NSString::from_str(
-        std::fs::canonicalize(file_path)?
-            .to_str()
-            .context("invalid utf-8 path")?,
-    ));
-
-    unsafe {
-        let file = AVAudioFile::initForReading_error(AVAudioFile::alloc(), &url)?;
-        let fmt = file.processingFormat();
-        let engine = AVAudioEngine::new();
-        let player = AVAudioPlayerNode::new();
-        let mixer = engine.mainMixerNode();
-        let fade_mixer = AVAudioMixerNode::new();
-        let matrix = make_matrix_mixer();
-
-        if matrix.is_none() {
-            eprintln!("matrix mixer could not be instantiated");
+    let file = open_audio_file(file_path)?;
+    let mut state = unsafe {
+        handling::AudioState {
+            engine: AVAudioEngine::new(),
+            player: AVAudioPlayerNode::new(),
+            pre_mixer: AVAudioMixerNode::new(),
+            chain: Vec::new(),
+            fade_mixer: AVAudioMixerNode::new(),
+            format: file.processingFormat(),
+            start_frame: 0,
+            path: file_path.to_path_buf(),
+            file,
         }
-
-        engine.attachNode(&player);
-        engine.attachNode(&fade_mixer);
-        for node in &nodes {
-            engine.attachNode(node);
-        }
-        if let Some(m) = &matrix {
-            engine.attachNode(m);
-        }
-
-        engine.connect_to_format(&player, &fade_mixer, Some(&fmt));
-
-        let mut prev: &AVAudioNode = &fade_mixer;
-        for node in &nodes {
-            engine.connect_to_format(prev, node, Some(&fmt));
-            prev = node;
-        }
-        match &matrix {
-            Some(m) => {
-                engine.connect_to_format(prev, m, Some(&fmt));
-                engine.connect_to_format(m, &mixer, Some(&fmt));
-            }
-            None => engine.connect_to_format(prev, &mixer, Some(&fmt)),
-        }
-
-        player.scheduleFile_atTime_completionHandler(&file, None, std::ptr::null_mut());
-        engine.startAndReturnError()?;
-        if let Some(m) = &matrix {
-            init_matrix_volumes(m);
-        }
-        player.play();
-
-        Ok(handling::AudioState {
-            engine,
-            player,
-            nodes,
-            fade_mixer,
-            matrix,
-        })
-    }
-}
-
-pub fn rewire(state: &mut handling::AudioState, nodes: Vec<Retained<AVAudioUnitEffect>>) {
-    unsafe {
-        let fmt = state.fade_mixer.outputFormatForBus(0);
-        let same = |a: &Retained<AVAudioUnitEffect>, b: &Retained<AVAudioUnitEffect>| {
-            Retained::as_ptr(a) == Retained::as_ptr(b)
-        };
-        for old in &state.nodes {
-            if !nodes.iter().any(|n| same(n, old)) {
-                state.engine.detachNode(old);
-            }
-        }
-        for node in &nodes {
-            if !state.nodes.iter().any(|o| same(o, node)) {
-                state.engine.attachNode(node);
-            }
-        }
-        let mut prev: &AVAudioNode = &state.fade_mixer;
-        for node in &nodes {
-            state.engine.connect_to_format(prev, node, Some(&fmt));
-            prev = node;
-        }
-        match &state.matrix {
-            Some(m) => state.engine.connect_to_format(prev, m, Some(&fmt)),
-            None => {
-                let main = state.engine.mainMixerNode();
-                state.engine.connect_to_format(prev, &main, Some(&fmt));
-            }
-        }
-        state.nodes = nodes;
-    }
-}
-
-struct SendUnit(Option<Retained<AVAudioUnit>>);
-unsafe impl Send for SendUnit {}
-
-fn make_matrix_mixer() -> Option<Retained<AVAudioUnit>> {
-    let desc = AudioComponentDescription {
-        componentType: u32::from_be_bytes(*b"aumx"),
-        componentSubType: u32::from_be_bytes(*b"mxmx"),
-        componentManufacturer: u32::from_be_bytes(*b"appl"),
-        componentFlags: 0,
-        componentFlagsMask: 0,
     };
-    let (tx, rx) = std::sync::mpsc::channel::<SendUnit>();
-    let block = RcBlock::new(move |unit: *mut AVAudioUnit, _err: *mut NSError| {
-        let retained = unsafe { Retained::retain(unit) };
-        let _ = tx.send(SendUnit(retained));
-    });
+
     unsafe {
-        AVAudioUnit::instantiateWithComponentDescription_options_completionHandler(
-            desc,
-            AudioComponentInstantiationOptions(0),
-            &block,
-        );
+        state.engine.attachNode(&state.player);
+        state.engine.attachNode(&state.pre_mixer);
+        state.engine.attachNode(&state.fade_mixer);
+        let main_mixer = state.engine.mainMixerNode();
+        state
+            .engine
+            .connect_to_format(&*state.player, &*state.pre_mixer, None);
+        state
+            .engine
+            .connect_to_format(&*state.fade_mixer, &*main_mixer, None);
+        state.fade_mixer.setOutputVolume(1.0);
     }
-    rx.recv_timeout(std::time::Duration::from_secs(3)).ok()?.0
+
+    connect_chain(&mut state, slots);
+    state.start_frame = schedule_from(&state, start_frame);
+
+    unsafe {
+        state.engine.prepare();
+        if let Err(error) = state.engine.startAndReturnError() {
+            let info: Retained<NSDictionary> = msg_send![&*error, userInfo];
+            let description: Retained<NSString> = msg_send![&*info, description];
+
+            println!("Audio engine error: {error:?}");
+            println!("Error details: {description}");
+
+            teardown(&state);
+            return Err(anyhow::anyhow!("Failed to start audio engine: {error:?}"));
+        }
+        state.player.play();
+    }
+
+    Ok(state)
 }
 
 pub fn make_button(

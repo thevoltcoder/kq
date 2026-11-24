@@ -9,7 +9,7 @@ pub use objc2_foundation::*;
 pub use std::{
     cell::{Cell, OnceCell, RefCell},
     path::{Path, PathBuf},
-    ptr::NonNull,
+    ptr::{NonNull, null_mut},
     time::Instant,
 };
 

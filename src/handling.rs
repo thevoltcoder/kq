@@ -5,6 +5,8 @@ pub struct RawAudioUnit {
     _private: [u8; 0],
 }
 
+pub type Slot = (usize, Retained<AVAudioUnitEffect>, bool);
+
 unsafe impl RefEncode for RawAudioUnit {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct(
         "ComponentInstanceRecord",
@@ -12,18 +14,14 @@ unsafe impl RefEncode for RawAudioUnit {
     ));
 }
 
+#[derive(Clone)]
 pub struct Installed {
     pub name: String,
     pub desc: AudioComponentDescription,
 }
 
-pub struct ChainItem {
-    pub index: usize,
-    pub node: Retained<AVAudioUnitEffect>,
-}
-
 pub struct Editor {
-    #[allow(dead_code)]
+    pub index: usize,
     pub window: Retained<NSWindow>,
     #[allow(dead_code)]
     pub factory: Option<Retained<AnyObject>>,
@@ -32,9 +30,13 @@ pub struct Editor {
 pub struct AudioState {
     pub engine: Retained<AVAudioEngine>,
     pub player: Retained<AVAudioPlayerNode>,
-    pub nodes: Vec<Retained<AVAudioUnitEffect>>,
+    pub pre_mixer: Retained<AVAudioMixerNode>,
+    pub chain: Vec<(usize, Retained<AVAudioUnitEffect>)>,
     pub fade_mixer: Retained<AVAudioMixerNode>,
-    pub matrix: Option<Retained<AVAudioUnit>>,
+    pub format: Retained<AVAudioFormat>,
+    pub start_frame: i64,
+    pub path: PathBuf,
+    pub file: Retained<AVAudioFile>,
 }
 
 pub struct AppIvars {
@@ -42,16 +44,23 @@ pub struct AppIvars {
     pub error_label: Retained<NSTextField>,
     pub search: Retained<NSSearchField>,
     pub available_table: Retained<NSTableView>,
-    pub chain_table: Retained<NSTableView>,
     pub installed: Vec<Installed>,
+    pub nodes: RefCell<Vec<Option<Retained<AVAudioUnitEffect>>>>,
     pub filtered: RefCell<Vec<usize>>,
-    pub chain: RefCell<Vec<ChainItem>>,
+    pub enabled: RefCell<Vec<bool>>,
     pub editors: RefCell<Vec<Editor>>,
     pub audio: RefCell<Option<AudioState>>,
     pub fade: RefCell<Option<Retained<NSTimer>>>,
     pub gain: Cell<f32>,
     pub gain_l: Cell<f32>,
     pub gain_r: Cell<f32>,
+    pub loading: RefCell<Vec<bool>>,
+    pub effect_tx: std::sync::mpsc::Sender<(usize, Result<usize, String>)>,
+    pub effect_rx: RefCell<std::sync::mpsc::Receiver<(usize, Result<usize, String>)>>,
+    pub pending_playback: RefCell<Option<(PathBuf, i64)>>,
+    pub pending_editor: Cell<Option<usize>>,
+    pub poll_timer: RefCell<Option<Retained<NSTimer>>>,
+    pub rebuild_at: Cell<Option<std::time::Instant>>,
 }
 
 define_class!(
@@ -70,6 +79,9 @@ define_class!(
             _sender: &NSApplication,
         ) -> bool {
             self.finish_stop();
+            if let Some(state) = self.ivars().audio.borrow().as_ref() {
+                helpers::teardown(state);
+            }
             true
         }
     }
@@ -80,7 +92,7 @@ define_class!(
             if std::ptr::eq(table, &*self.ivars().available_table) {
                 self.ivars().filtered.borrow().len() as NSInteger
             } else {
-                self.ivars().chain.borrow().len() as NSInteger
+                self.ivars().installed.len() as NSInteger
             }
         }
 
@@ -95,19 +107,32 @@ define_class!(
             let index = if std::ptr::eq(table, &*ivars.available_table) {
                 ivars.filtered.borrow().get(row as usize).copied()
             } else {
-                ivars.chain.borrow().get(row as usize).map(|c| c.index)
+                Some(row as usize)
             };
             match index {
-                Some(i) => {
-                    let title = NSString::from_str(&ivars.installed[i].name);
+                Some(i) if i < ivars.installed.len() => {
+                    let mark = if ivars.enabled.borrow()[i] { "● " } else { "○ " };
+                    let title = NSString::from_str(&format!("{mark}{}", ivars.installed[i].name));
                     Retained::autorelease_ptr(title) as *mut NSObject
                 }
-                None => std::ptr::null_mut(),
+                _ => std::ptr::null_mut(),
             }
         }
     }
 
     impl AppHandler {
+        #[unsafe(method(onSelect:))]
+        fn on_select(&self, _sender: Option<&AnyObject>) {
+            let row = self.ivars().available_table.clickedRow();
+            if row < 0 {
+                return;
+            }
+            let picked = self.ivars().filtered.borrow().get(row as usize).copied();
+            if let Some(index) = picked {
+                self.request_node(index);
+            }
+        }
+
         #[unsafe(method(onPlay:))]
         fn on_play(&self, _sender: Option<&AnyObject>) {
             self.finish_stop();
@@ -118,24 +143,7 @@ define_class!(
                 self.set_error(format!("Not a supported audio file: {}", path.display()));
                 return;
             }
-
-            let nodes: Vec<Retained<AVAudioUnitEffect>> = self
-                .ivars()
-                .chain
-                .borrow()
-                .iter()
-                .map(|c| c.node.clone())
-                .collect();
-
-            match helpers::start_audio(&path, nodes) {
-                Ok(state) => {
-                    *self.ivars().audio.borrow_mut() = Some(state);
-                    self.apply_gain();
-                    self.apply_channel_gains();
-                    self.set_error(String::new());
-                }
-                Err(e) => self.set_error(e.to_string()),
-            }
+            self.start_playback(&path, 0);
         }
 
         #[unsafe(method(onStop:))]
@@ -158,30 +166,14 @@ define_class!(
             ivars.available_table.reloadData();
         }
 
-        #[unsafe(method(onAdd:))]
-        fn on_add(&self, _sender: Option<&AnyObject>) {
-            self.add_selected();
+        #[unsafe(method(onEnable:))]
+        fn on_enable(&self, _sender: Option<&AnyObject>) {
+            self.set_selected_enabled(true);
         }
 
-        #[unsafe(method(onAvailableDouble:))]
-        fn on_available_double(&self, _sender: Option<&AnyObject>) {
-            self.add_selected();
-        }
-
-        #[unsafe(method(onRemove:))]
-        fn on_remove(&self, _sender: Option<&AnyObject>) {
-            let ivars = self.ivars();
-            let row = ivars.chain_table.selectedRow();
-            if row < 0 {
-                return;
-            }
-            let mut chain = ivars.chain.borrow_mut();
-            if (row as usize) < chain.len() {
-                chain.remove(row as usize);
-            }
-            drop(chain);
-            ivars.chain_table.reloadData();
-            self.rewire();
+        #[unsafe(method(onDisable:))]
+        fn on_disable(&self, _sender: Option<&AnyObject>) {
+            self.set_selected_enabled(false);
         }
 
         #[unsafe(method(onEdit:))]
@@ -189,8 +181,8 @@ define_class!(
             self.edit_selected();
         }
 
-        #[unsafe(method(onChainDouble:))]
-        fn on_chain_double(&self, _sender: Option<&AnyObject>) {
+        #[unsafe(method(onAvailableDouble:))]
+        fn on_available_double(&self, _sender: Option<&AnyObject>) {
             self.edit_selected();
         }
 
@@ -223,28 +215,57 @@ impl AppHandler {
         error_label: Retained<NSTextField>,
         search: Retained<NSSearchField>,
         available_table: Retained<NSTableView>,
-        chain_table: Retained<NSTableView>,
     ) -> Retained<Self> {
         let installed = helpers::list_installed_effects();
         let filtered = (0..installed.len()).collect();
+        let enabled = vec![false; installed.len()];
+        let nodes = (0..installed.len()).map(|_| None).collect();
+        let loading = vec![false; installed.len()];
+
+        let (effect_tx, effect_rx) = std::sync::mpsc::channel();
+
         let this = mtm.alloc::<Self>().set_ivars(AppIvars {
             field,
             error_label,
             search,
             available_table,
-            chain_table,
             installed,
+            nodes: RefCell::new(nodes),
+            loading: RefCell::new(loading),
+            effect_tx,
+            effect_rx: RefCell::new(effect_rx),
+            pending_playback: RefCell::new(None),
+            pending_editor: Cell::new(None),
+            poll_timer: RefCell::new(None),
             filtered: RefCell::new(filtered),
-            chain: RefCell::new(Vec::new()),
+            enabled: RefCell::new(enabled),
             editors: RefCell::new(Vec::new()),
             audio: RefCell::new(None),
             fade: RefCell::new(None),
             gain: Cell::new(1.0),
             gain_l: Cell::new(1.0),
             gain_r: Cell::new(1.0),
+            rebuild_at: Cell::new(None),
         });
 
-        unsafe { msg_send![super(this), init] }
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+
+        let handler = this.clone();
+
+        let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            handler.poll_effects();
+        });
+
+        let timer =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.001, true, &block) };
+
+        *this.ivars().poll_timer.borrow_mut() = Some(timer);
+
+        for index in 0..this.ivars().installed.len() {
+            this.request_node(index);
+        }
+
+        this
     }
 
     fn db_to_lin(db: f64) -> f32 {
@@ -260,26 +281,9 @@ impl AppHandler {
         self.apply_gain();
     }
 
-    pub fn set_gain_l(&self, db: f64) {
-        self.ivars().gain_l.set(Self::db_to_lin(db));
-        self.apply_channel_gains();
-    }
+    pub fn set_gain_l(&self, _db: f64) {}
 
-    pub fn set_gain_r(&self, db: f64) {
-        self.ivars().gain_r.set(Self::db_to_lin(db));
-        self.apply_channel_gains();
-    }
-
-    fn apply_channel_gains(&self) {
-        let l = self.ivars().gain_l.get();
-        let r = self.ivars().gain_r.get();
-        if let Some(state) = self.ivars().audio.borrow().as_ref() {
-            if let Some(matrix) = state.matrix.as_ref() {
-                helpers::set_matrix_gain(matrix, 0, 0, l);
-                helpers::set_matrix_gain(matrix, 1, 1, r);
-            }
-        }
-    }
+    pub fn set_gain_r(&self, _db: f64) {}
 
     fn apply_gain(&self) {
         let gain = self.ivars().gain.get();
@@ -296,57 +300,100 @@ impl AppHandler {
         label.setAlphaValue(if message.is_empty() { 0.0 } else { 1.0 });
     }
 
-    pub fn add_selected(&self) {
+    fn request_node(&self, index: usize) {
+        let ivars = self.ivars();
+        if index >= ivars.installed.len() || ivars.nodes.borrow()[index].is_some() {
+            return;
+        }
+        {
+            let mut loading = ivars.loading.borrow_mut();
+            if loading[index] {
+                return;
+            }
+            loading[index] = true;
+        }
+        let desc = ivars.installed[index].desc;
+        if desc.componentSubType == u32::from_be_bytes(*b"nbeq") {
+            let node = helpers::instantiate_builtin_eq();
+            ivars.nodes.borrow_mut()[index] = Some(node);
+            ivars.loading.borrow_mut()[index] = false;
+            self.effect_ready(index);
+            return;
+        }
+        helpers::instantiate_effect_async(desc, index, ivars.effect_tx.clone());
+    }
+
+    fn set_selected_enabled(&self, on: bool) {
         let ivars = self.ivars();
         let row = ivars.available_table.selectedRow();
         if row < 0 {
             return;
         }
         let picked = ivars.filtered.borrow().get(row as usize).copied();
-        if let Some(index) = picked {
-            let desc = ivars.installed[index].desc;
-            let node: Retained<AVAudioUnitEffect> = unsafe {
-                if desc.componentSubType == u32::from_be_bytes(*b"nbeq") {
-                    Retained::into_super(AVAudioUnitEQ::initWithNumberOfBands(
-                        AVAudioUnitEQ::alloc(),
-                        4,
-                    ))
-                } else {
-                    AVAudioUnitEffect::initWithAudioComponentDescription(
-                        AVAudioUnitEffect::alloc(),
-                        desc,
-                    )
-                }
-            };
-            ivars.chain.borrow_mut().push(ChainItem { index, node });
-            ivars.chain_table.reloadData();
-            self.rewire();
+        let Some(index) = picked else {
+            return;
+        };
+        self.set_effect(index, on);
+        ivars.available_table.reloadData();
+        let set = NSIndexSet::indexSetWithIndex(row as usize);
+        ivars
+            .available_table
+            .selectRowIndexes_byExtendingSelection(&set, false);
+    }
+
+    pub fn set_effect(&self, index: usize, on: bool) {
+        let ivars = self.ivars();
+        {
+            let mut enabled = ivars.enabled.borrow_mut();
+            if index >= enabled.len() || enabled[index] == on {
+                return;
+            }
+            enabled[index] = on;
+        }
+        if on {
+            self.request_node(index);
+        }
+        if let Some(state) = ivars.audio.borrow().as_ref() {
+            helpers::set_effect_enabled(state, index, on);
         }
     }
 
     pub fn edit_selected(&self) {
         let ivars = self.ivars();
-        let row = ivars.chain_table.selectedRow();
+        let row = ivars.available_table.selectedRow();
         if row < 0 {
             return;
         }
-        let picked = ivars
-            .chain
-            .borrow()
-            .get(row as usize)
-            .map(|c| (c.node.clone(), ivars.installed[c.index].name.clone()));
-        if let Some((node, name)) = picked {
-            self.open_editor(&node, name);
+        let index = ivars.filtered.borrow().get(row as usize).copied();
+        let Some(index) = index else {
+            return;
+        };
+        {
+            let editors = ivars.editors.borrow();
+            if let Some(editor) = editors.iter().find(|e| e.index == index) {
+                ivars.pending_editor.set(None);
+                editor.window.makeKeyAndOrderFront(None);
+                return;
+            }
+        }
+        if let Some(node) = ivars.nodes.borrow()[index].clone() {
+            let name = ivars.installed[index].name.clone();
+            self.open_editor(index, &node, name);
+        } else {
+            ivars.pending_editor.set(Some(index));
+            self.request_node(index);
         }
     }
 
-    pub fn open_editor(&self, node: &AVAudioUnitEffect, title: String) {
+    pub fn open_editor(&self, index: usize, node: &AVAudioUnitEffect, title: String) {
         let mtm = self.mtm();
+        let raw = helpers::raw_audio_unit(node);
 
-        match helpers::cocoa_view(helpers::raw_audio_unit(node)) {
+        match helpers::cocoa_view(raw) {
             Some((view, factory)) => {
                 let window = helpers::editor_window(mtm, &view, &title);
                 self.ivars().editors.borrow_mut().push(Editor {
+                    index,
                     window,
                     factory: Some(factory),
                 });
@@ -354,15 +401,13 @@ impl AppHandler {
             }
             None => {
                 let view = unsafe {
-                    AUGenericView::initWithAudioUnit(
-                        mtm.alloc::<AUGenericView>(),
-                        helpers::raw_audio_unit(node) as AudioUnit,
-                    )
+                    AUGenericView::initWithAudioUnit(mtm.alloc::<AUGenericView>(), raw as AudioUnit)
                 };
 
                 let window = helpers::editor_window(mtm, &view, &title);
 
                 self.ivars().editors.borrow_mut().push(Editor {
+                    index,
                     window,
                     factory: None,
                 });
@@ -373,20 +418,13 @@ impl AppHandler {
     }
 
     pub fn finish_stop(&self) {
+        self.ivars().pending_playback.borrow_mut().take();
         if let Some(timer) = self.ivars().fade.borrow_mut().take() {
             timer.invalidate();
         }
-        if let Some(state) = self.ivars().audio.borrow_mut().take() {
-            unsafe {
-                state.player.stop();
-                state.engine.stop();
-                for node in &state.nodes {
-                    state.engine.detachNode(node);
-                }
-                if let Some(matrix) = &state.matrix {
-                    state.engine.detachNode(matrix);
-                }
-            }
+        let state = self.ivars().audio.borrow_mut().take();
+        if let Some(state) = state {
+            helpers::teardown(&state);
         }
     }
 
@@ -409,16 +447,138 @@ impl AppHandler {
         *self.ivars().fade.borrow_mut() = Some(timer);
     }
 
-    fn rewire(&self) {
-        let nodes: Vec<Retained<AVAudioUnitEffect>> = self
-            .ivars()
-            .chain
+    fn start_playback(&self, path: &Path, frame: i64) {
+        *self.ivars().pending_playback.borrow_mut() = Some((path.to_path_buf(), frame));
+
+        self.try_start_pending_playback();
+    }
+
+    fn try_start_pending_playback(&self) {
+        let ivars = self.ivars();
+        if ivars.audio.borrow().is_some() {
+            return;
+        }
+        let Some((path, frame)) = ivars.pending_playback.borrow().clone() else {
+            return;
+        };
+        let enabled = ivars.enabled.borrow().clone();
+        for (index, on) in enabled.iter().enumerate() {
+            if *on && ivars.nodes.borrow()[index].is_none() {
+                self.request_node(index);
+                return;
+            }
+        }
+        ivars.pending_playback.borrow_mut().take();
+        let slots = self.loaded_slots();
+        match helpers::start_audio(&path, &slots, frame) {
+            Ok(state) => {
+                *ivars.audio.borrow_mut() = Some(state);
+                self.apply_gain();
+                self.set_error(String::new());
+            }
+            Err(error) => {
+                self.set_error(error.to_string());
+            }
+        }
+    }
+
+    fn poll_effects(&self) {
+        loop {
+            let result = self.ivars().effect_rx.borrow().try_recv();
+
+            let (index, result) = match result {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            };
+
+            if index >= self.ivars().installed.len() {
+                continue;
+            }
+
+            self.ivars().loading.borrow_mut()[index] = false;
+
+            match result {
+                Ok(raw) => {
+                    let unit =
+                        unsafe { Retained::<AVAudioUnit>::from_raw(raw as *mut AVAudioUnit) };
+
+                    let Some(unit) = unit else {
+                        self.set_error("Received a null Audio Unit".to_string());
+                        continue;
+                    };
+
+                    match unit.downcast::<AVAudioUnitEffect>() {
+                        Ok(effect) => {
+                            self.ivars().nodes.borrow_mut()[index] = Some(effect);
+                            self.effect_ready(index);
+                        }
+                        Err(_) => {
+                            self.set_error(format!(
+                                "Audio Unit {} is not an AVAudioUnitEffect",
+                                self.ivars().installed[index].name
+                            ));
+                        }
+                    }
+                }
+
+                Err(error) => {
+                    self.ivars().pending_playback.borrow_mut().take();
+
+                    if self.ivars().pending_editor.get() == Some(index) {
+                        self.ivars().pending_editor.set(None);
+                    }
+
+                    self.set_error(format!(
+                        "Failed to instantiate {}: {}",
+                        self.ivars().installed[index].name,
+                        error
+                    ));
+                }
+            }
+        }
+    }
+
+    fn effect_ready(&self, index: usize) {
+        self.sync_chain();
+        if self.ivars().pending_editor.get() == Some(index) {
+            self.ivars().pending_editor.set(None);
+
+            let node = self.ivars().nodes.borrow()[index].as_ref().cloned();
+
+            if let Some(node) = node {
+                let name = self.ivars().installed[index].name.clone();
+                self.open_editor(index, &node, name);
+            }
+        }
+
+        self.try_start_pending_playback();
+    }
+
+    fn loaded_slots(&self) -> Vec<Slot> {
+        let ivars = self.ivars();
+        let enabled = ivars.enabled.borrow();
+        ivars
+            .nodes
             .borrow()
             .iter()
-            .map(|c| c.node.clone())
-            .collect();
-        if let Some(state) = self.ivars().audio.borrow_mut().as_mut() {
-            helpers::rewire(state, nodes);
+            .enumerate()
+            .filter_map(|(i, n)| n.as_ref().map(|n| (i, n.clone(), enabled[i])))
+            .collect()
+    }
+
+    fn sync_chain(&self) {
+        let ivars = self.ivars();
+        if ivars.fade.borrow().is_some() {
+            return;
+        }
+        let slots = self.loaded_slots();
+        let mut audio = ivars.audio.borrow_mut();
+        let Some(state) = audio.as_mut() else {
+            return;
+        };
+        for (index, node, on) in &slots {
+            helpers::insert_effect(state, *index, node, *on);
         }
     }
 }
