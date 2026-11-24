@@ -61,6 +61,7 @@ fn main() {
     };
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTabbingMode(NSWindowTabbingMode::Disallowed);
+    window.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
     window.setTitle(ns_string!("kq"));
     window.setContentMinSize(NSSize::new(560.0, 340.0));
 
@@ -77,10 +78,23 @@ fn main() {
     let file_row = make_stack(
         &[
             Retained::into_super(Retained::into_super(field.clone())),
-            Retained::into_super(Retained::into_super(browse_btn)),
+            Retained::into_super(Retained::into_super(browse_btn.clone())),
         ],
         NSStackViewDistribution::Fill,
         mtm,
+    );
+    browse_btn.setContentHuggingPriority_forOrientation(
+        1000.0,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
+    browse_btn.setContentCompressionResistancePriority_forOrientation(
+        1000.0,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
+
+    field.setContentCompressionResistancePriority_forOrientation(
+        250.0,
+        NSLayoutConstraintOrientation::Horizontal,
     );
 
     let button_row = make_stack(
@@ -153,6 +167,58 @@ fn main() {
     let description_content = NSView::new(mtm);
     description_content.setTranslatesAutoresizingMaskIntoConstraints(false);
 
+    file_row.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let cue_id = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    cue_id.setEditable(true);
+    cue_id.setSelectable(true);
+    cue_id.setPlaceholderString(Some(ns_string!("Cue ID")));
+    cue_id.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let cue_name = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    cue_name.setEditable(true);
+    cue_name.setSelectable(true);
+    cue_name.setPlaceholderString(Some(ns_string!("Cue Name")));
+    cue_name.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    description_content.addSubview(&file_row);
+    description_content.addSubview(&cue_id);
+    description_content.addSubview(&cue_name);
+
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        file_row
+            .leadingAnchor()
+            .constraintEqualToAnchor(&description_content.leadingAnchor()),
+        file_row
+            .widthAnchor()
+            .constraintEqualToAnchor(&description_content.widthAnchor()),
+        file_row
+            .trailingAnchor()
+            .constraintEqualToAnchor(&description_content.trailingAnchor()),
+        file_row
+            .topAnchor()
+            .constraintEqualToAnchor(&description_content.topAnchor()),
+        cue_id
+            .leadingAnchor()
+            .constraintEqualToAnchor(&description_content.leadingAnchor()),
+        cue_id
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&file_row.bottomAnchor(), 12.0),
+        cue_name
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&cue_id.trailingAnchor(), 8.0),
+        cue_name
+            .trailingAnchor()
+            .constraintEqualToAnchor(&description_content.trailingAnchor()),
+        cue_name
+            .topAnchor()
+            .constraintEqualToAnchor(&cue_id.topAnchor()),
+        cue_id
+            .widthAnchor()
+            .constraintEqualToAnchor_multiplier(&cue_name.widthAnchor(), 0.2),
+        browse_btn.widthAnchor().constraintEqualToConstant(90.0),
+    ]));
+
     let levels_tab_content = padded_tab_content(&levels_content, 16.0, mtm);
     let description_tab_content = padded_tab_content(&description_content, 16.0, mtm);
     let filters_tab_content = padded_tab_content(&left_col, 16.0, mtm);
@@ -180,7 +246,6 @@ fn main() {
 
     let root = make_stack(
         &[
-            Retained::into_super(file_row.clone()),
             Retained::into_super(button_row.clone()),
             Retained::into_super(tabs.clone()),
             Retained::into_super(Retained::into_super(error_label.clone())),
@@ -209,9 +274,6 @@ fn main() {
             .constraintEqualToAnchor_constant(&content.topAnchor(), 20.0),
         root.bottomAnchor()
             .constraintEqualToAnchor_constant(&content.bottomAnchor(), -20.0),
-        file_row
-            .widthAnchor()
-            .constraintEqualToAnchor(&root.widthAnchor()),
         button_row
             .widthAnchor()
             .constraintEqualToAnchor(&root.widthAnchor()),

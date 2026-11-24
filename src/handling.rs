@@ -61,6 +61,7 @@ pub struct AppIvars {
     pub pending_editor: Cell<Option<usize>>,
     pub poll_timer: RefCell<Option<Retained<NSTimer>>>,
     pub rebuild_at: Cell<Option<std::time::Instant>>,
+    pub termination_confirmed: Cell<bool>,
 }
 
 define_class!(
@@ -78,13 +79,34 @@ define_class!(
             &self,
             _sender: &NSApplication,
         ) -> bool {
-            self.finish_stop();
-            if let Some(state) = self.ivars().audio.borrow().as_ref() {
-                helpers::teardown(state);
-            }
             true
         }
+
+        #[unsafe(method(applicationShouldTerminate:))]
+        fn application_should_terminate(
+            &self,
+            _sender: &NSApplication,
+        ) -> NSApplicationTerminateReply {
+            let ivars = self.ivars();
+
+            if ivars.termination_confirmed.get() {
+                return NSApplicationTerminateReply::TerminateNow;
+            }
+
+            if !self.confirm_close() {
+                return NSApplicationTerminateReply::TerminateCancel;
+            }
+
+            ivars.termination_confirmed.set(true);
+
+            self.close_editors();
+            self.finish_stop();
+
+            NSApplicationTerminateReply::TerminateNow
+        }
     }
+
+    unsafe impl NSWindowDelegate for AppHandler {}
 
     unsafe impl NSTableViewDataSource for AppHandler {
         #[unsafe(method(numberOfRowsInTableView:))]
@@ -121,6 +143,26 @@ define_class!(
     }
 
     impl AppHandler {
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> objc2::runtime::Bool {
+            let ivars = self.ivars();
+
+            if ivars.termination_confirmed.get() {
+                return objc2::runtime::Bool::YES;
+            }
+
+            if !self.confirm_close() {
+                return objc2::runtime::Bool::NO;
+            }
+
+            ivars.termination_confirmed.set(true);
+
+            self.close_editors();
+            self.finish_stop();
+
+            objc2::runtime::Bool::YES
+        }
+
         #[unsafe(method(onSelect:))]
         fn on_select(&self, _sender: Option<&AnyObject>) {
             let row = self.ivars().available_table.clickedRow();
@@ -246,6 +288,7 @@ impl AppHandler {
             gain_l: Cell::new(1.0),
             gain_r: Cell::new(1.0),
             rebuild_at: Cell::new(None),
+            termination_confirmed: Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -266,6 +309,26 @@ impl AppHandler {
         }
 
         this
+    }
+
+    fn confirm_close(&self) -> bool {
+        let alert = NSAlert::new(self.mtm());
+
+        alert.setMessageText(ns_string!("Are you sure you want to close?"));
+        alert.setInformativeText(ns_string!("Any unsaved changes will be lost."));
+
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        alert.addButtonWithTitle(ns_string!("Close Anyway"));
+
+        alert.runModal() == NSAlertSecondButtonReturn
+    }
+
+    fn close_editors(&self) {
+        let editors = std::mem::take(&mut *self.ivars().editors.borrow_mut());
+
+        for editor in editors {
+            editor.window.close();
+        }
     }
 
     fn db_to_lin(db: f64) -> f32 {
