@@ -17,7 +17,8 @@ Used by:
 
 {{!--
   to generate:
-  1. cargo about init
+  1. cargo install cargo-about --features=cli
+  2. cargo about init
     a. edit about.toml and replace accepted with:
 accepted = [
     "Apache-2.0",
@@ -28,6 +29,15 @@ accepted = [
     "Unlicense",
     "Unicode-3.0",
 ]
-  2. cargo about generate about.hbs -o LICENSE.txt
-  3. pandoc LICENSE.txt -s -o LICENSE.rtf
+  3. cargo about generate about.hbs -o LICENSE.txt
+  4. brew install pandoc
+    a. install homebrew if you havent (for some reason)
+  5. pandoc LICENSE.txt -s -o LICENSE.rtf
+
+  to bundle with dmg (make sure you have a valid .app bundle):
+  1. codesign --verify --deep --strict --verbose=2 kq.app
+  2. brew install create-dmg
+  3. mkdir dist
+  4. cp -R /target/release/kq.app LICENSE.rtf dist/
+  5. create-dmg --volname "kq" --app-drop-link 450 185 --icon "kq.app" 150 185 --window-size 600 400 kq.dmg dist/
 --}}
