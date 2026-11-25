@@ -8,8 +8,9 @@ pub use objc2_core_audio_kit::*;
 pub use objc2_foundation::*;
 pub use std::{
     cell::{Cell, OnceCell, RefCell},
+    ffi::c_void,
     path::{Path, PathBuf},
-    ptr::{NonNull, null_mut},
+    ptr::{NonNull, null, null_mut},
     time::Instant,
 };
 
@@ -22,3 +23,4 @@ const COCOA_UI_PROPERTY: u32 = 31;
 pub mod custom;
 pub mod handling;
 pub mod helpers;
+pub mod rt;

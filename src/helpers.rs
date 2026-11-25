@@ -121,30 +121,102 @@ pub fn editor_window(mtm: MainThreadMarker, view: &NSView, title: &str) -> Retai
     window
 }
 
-pub fn fade_out<F>(player: Retained<AVAudioPlayerNode>, on_complete: F) -> Retained<NSTimer>
+pub fn fade_out<F>(sh: std::sync::Arc<rt::Shared>, on_complete: F) -> Retained<NSTimer>
 where
     F: FnOnce() + 'static,
 {
-    let start_gain = unsafe { player.volume() };
     let start = Instant::now();
     let on_complete = RefCell::new(Some(on_complete));
-
     let block = RcBlock::new(move |timer: NonNull<NSTimer>| {
         let progress = start.elapsed().as_secs_f32() / FADE_SECS;
         if progress >= 1.0 {
-            unsafe {
-                player.setVolume(0.0);
-                timer.as_ref().invalidate();
-            }
-            if let Some(callback) = on_complete.borrow_mut().take() {
-                callback();
+            sh.set_fade(0.0);
+            unsafe { timer.as_ref().invalidate() };
+            if let Some(cb) = on_complete.borrow_mut().take() {
+                cb();
             }
         } else {
-            unsafe { player.setVolume(fade_gain(start_gain, FADE_MIN_DB, progress)) };
+            sh.set_fade(fade_gain(1.0, FADE_MIN_DB, progress));
         }
     });
-
     unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(FADE_TICK_SECS, true, &block) }
+}
+
+pub fn current_frame(state: &handling::AudioState) -> i64 {
+    state.sh.pos.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+pub fn insert_effect(
+    state: &handling::AudioState,
+    index: usize,
+    effect: &Retained<AVAudioUnitEffect>,
+    on: bool,
+) {
+    state.add_unit(index, raw_audio_unit(effect) as *mut std::ffi::c_void, on);
+}
+
+pub fn set_effect_enabled(state: &handling::AudioState, index: usize, enabled: bool) {
+    state.sh.enabled[index].store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn play_audio(state: &handling::AudioState, path: &Path, frame: i64) -> anyhow::Result<()> {
+    let track = load_track(path)?;
+    state.play(track, frame.max(0) as usize);
+    Ok(())
+}
+
+fn load_track(path: &Path) -> anyhow::Result<std::sync::Arc<rt::Track>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    struct S(Retained<AVAudioFile>);
+    unsafe impl Send for S {}
+
+    let file = open_audio_file(path)?;
+    let (len, rate, ch) = unsafe {
+        let f = file.processingFormat();
+        (
+            file.length() as usize,
+            f.sampleRate(),
+            f.channelCount() as usize,
+        )
+    };
+    let track = rt::Track::new(len, rate);
+    let t = track.clone();
+    let s = S(file);
+
+    std::thread::spawn(move || unsafe {
+        let s = s;
+        let fmt = s.0.processingFormat();
+        let cls = AnyClass::get(c"AVAudioPCMBuffer").unwrap();
+        let alloc: Allocated<AnyObject> = msg_send![cls, alloc];
+        let buf: Retained<AnyObject> =
+            msg_send![alloc, initWithPCMFormat: &*fmt, frameCapacity: 8192u32];
+        let mut done = 0usize;
+        while done < len && !t.cancel.load(Relaxed) {
+            let n = (len - done).min(8192) as u32;
+            let mut err: *mut NSError = std::ptr::null_mut();
+            let ok: objc2::runtime::Bool =
+                msg_send![&*s.0, readIntoBuffer: &*buf, frameCount: n, error: &mut err];
+            if !ok.as_bool() {
+                println!("decode failed at {done}: {err:?}");
+                break;
+            }
+            let got: u32 = msg_send![&*buf, frameLength];
+            if got == 0 {
+                break;
+            }
+            let data: *const *const f32 = msg_send![&*buf, floatChannelData];
+            let l = *data;
+            let r = if ch > 1 { *data.add(1) } else { l };
+            t.write(done, l, r, got as usize);
+            done += got as usize;
+        }
+        t.total.store(done, std::sync::atomic::Ordering::Release);
+        println!(
+            "decoded {done}/{len}, render calls={}",
+            rt::CALLS.load(Relaxed)
+        );
+    });
+    Ok(track)
 }
 
 pub fn instantiate_builtin_eq() -> Retained<AVAudioUnitEffect> {
@@ -189,131 +261,6 @@ pub fn instantiate_effect_async(
     }
 }
 
-fn schedule_from(state: &handling::AudioState, frame: i64) -> i64 {
-    unsafe {
-        let length = state.file.length();
-        let frame = if frame >= length { 0 } else { frame.max(0) };
-        state
-            .player
-            .scheduleSegment_startingFrame_frameCount_atTime_completionHandler(
-                &state.file,
-                frame,
-                (length - frame) as u32,
-                None,
-                null_mut(),
-            );
-        frame
-    }
-}
-
-pub fn current_frame(state: &handling::AudioState) -> i64 {
-    unsafe {
-        let Some(node_time) = state.player.lastRenderTime() else {
-            return state.start_frame;
-        };
-        let Some(player_time) = state.player.playerTimeForNodeTime(&node_time) else {
-            return state.start_frame;
-        };
-        state.start_frame + player_time.sampleTime().max(0)
-    }
-}
-
-fn connect_chain(state: &mut handling::AudioState, slots: &[handling::Slot]) {
-    unsafe {
-        let mut next: Vec<(usize, Retained<AVAudioUnitEffect>)> = Vec::new();
-        for (index, effect, on) in slots {
-            let already = state.chain.iter().any(|(i, _)| i == index);
-            if !already {
-                state.engine.attachNode(&**effect);
-            }
-            effect.setBypass(!*on);
-            next.push((*index, effect.clone()));
-        }
-        state.chain = next;
-
-        let source: &AVAudioNode = &state.pre_mixer;
-        let output: &AVAudioNode = &state.fade_mixer;
-        let mut nodes: Vec<&AVAudioNode> = vec![source];
-        for (_, effect) in &state.chain {
-            nodes.push(&**effect);
-        }
-        nodes.push(output);
-        for pair in nodes.windows(2) {
-            state
-                .engine
-                .connect_to_format(pair[0], pair[1], Some(&state.format));
-        }
-    }
-}
-
-pub fn insert_effect(
-    state: &mut handling::AudioState,
-    index: usize,
-    effect: &Retained<AVAudioUnitEffect>,
-    on: bool,
-) {
-    if state.chain.iter().any(|(i, _)| *i == index) {
-        return;
-    }
-
-    unsafe {
-        effect.setBypass(!on);
-        state.engine.attachNode(&**effect);
-
-        let node: &AVAudioNode = &**effect;
-        let mixer: &AVAudioNode = &state.fade_mixer;
-        let pre: &AVAudioNode = &state.pre_mixer;
-        let upstream: &AVAudioNode = match state.chain.last() {
-            Some((_, last)) => &**last,
-            None => pre,
-        };
-
-        let format = state.format.clone();
-
-        state.engine.disconnectNodeOutput(upstream);
-        state
-            .engine
-            .connect_to_format(upstream, node, Some(&format));
-        state.engine.connect_to_format(node, mixer, Some(&format));
-
-        println!(
-            "after connect: up={:?} fx_in={:?} fx_out={:?} running={} playing={}",
-            format,
-            node.inputFormatForBus(0),
-            node.outputFormatForBus(0),
-            state.engine.isRunning(),
-            state.player.isPlaying()
-        );
-    }
-
-    state.chain.push((index, effect.clone()));
-}
-
-pub fn set_effect_enabled(state: &handling::AudioState, index: usize, enabled: bool) {
-    if let Some((_, effect)) = state
-        .chain
-        .iter()
-        .find(|(effect_index, _)| *effect_index == index)
-    {
-        unsafe {
-            effect.setBypass(!enabled);
-        }
-    }
-}
-
-pub fn teardown(state: &handling::AudioState) {
-    unsafe {
-        state.player.stop();
-        state.engine.stop();
-        for (_, effect) in &state.chain {
-            state.engine.detachNode(effect);
-        }
-        state.engine.detachNode(&state.fade_mixer);
-        state.engine.detachNode(&state.player);
-        state.engine.detachNode(&state.pre_mixer);
-    }
-}
-
 fn open_audio_file(file_path: &Path) -> anyhow::Result<Retained<AVAudioFile>> {
     let url = NSURL::from_file_path(file_path).context("invalid audio file path")?;
     let allocated = AVAudioFile::alloc();
@@ -327,77 +274,89 @@ fn open_audio_file(file_path: &Path) -> anyhow::Result<Retained<AVAudioFile>> {
     file.ok_or_else(|| anyhow::anyhow!("Failed to open audio file: {:?}", error))
 }
 
-pub fn play_audio(
-    state: &mut handling::AudioState,
-    file_path: &Path,
-    start_frame: i64,
-) -> anyhow::Result<()> {
-    let file = open_audio_file(file_path)?;
-    unsafe {
-        state.player.stop();
-    }
-    state.file = file;
-    state.path = file_path.to_path_buf();
-    state.start_frame = schedule_from(state, start_frame);
-    unsafe {
-        state.player.play();
-    }
-    Ok(())
-}
-
-pub fn start_audio(
-    file_path: &Path,
-    slots: &[handling::Slot],
-    start_frame: i64,
-) -> anyhow::Result<handling::AudioState> {
-    let file = open_audio_file(file_path)?;
-    let mut state = unsafe {
-        handling::AudioState {
-            engine: AVAudioEngine::new(),
-            player: AVAudioPlayerNode::new(),
-            pre_mixer: AVAudioMixerNode::new(),
-            chain: Vec::new(),
-            fade_mixer: AVAudioMixerNode::new(),
-            format: file.processingFormat(),
-            start_frame: 0,
-            path: file_path.to_path_buf(),
-            file,
-        }
+pub fn set_buffer_frames(want: u32) -> Result<u32, String> {
+    use coreaudio_sys::{
+        AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
+        AudioObjectSetPropertyData, AudioValueRange, kAudioDevicePropertyBufferFrameSize,
+        kAudioDevicePropertyBufferFrameSizeRange, kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectSystemObject,
     };
-
     unsafe {
-        state.engine.attachNode(&state.player);
-        state.engine.attachNode(&state.pre_mixer);
-        state.engine.attachNode(&state.fade_mixer);
-        let main_mixer = state.engine.mainMixerNode();
-        state
-            .engine
-            .connect_to_format(&*state.player, &*state.pre_mixer, None);
-        state
-            .engine
-            .connect_to_format(&*state.fade_mixer, &*main_mixer, None);
-        state.fade_mixer.setOutputVolume(1.0);
-    }
-
-    connect_chain(&mut state, slots);
-    state.start_frame = schedule_from(&state, start_frame);
-
-    unsafe {
-        state.engine.prepare();
-        if let Err(error) = state.engine.startAndReturnError() {
-            let info: Retained<NSDictionary> = msg_send![&*error, userInfo];
-            let description: Retained<NSString> = msg_send![&*info, description];
-
-            println!("Audio engine error: {error:?}");
-            println!("Error details: {description}");
-
-            teardown(&state);
-            return Err(anyhow::anyhow!("Failed to start audio engine: {error:?}"));
+        let mut dev: AudioObjectID = 0;
+        let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+        let addr = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMaster,
+        };
+        let s = AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &addr,
+            0,
+            null(),
+            &mut size,
+            &mut dev as *mut _ as *mut c_void,
+        );
+        if s != 0 {
+            return Err(format!("get default device: {s}"));
         }
-        state.player.play();
-    }
 
-    Ok(state)
+        let range_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMaster,
+        };
+        let mut range = AudioValueRange {
+            mMinimum: 0.0,
+            mMaximum: 0.0,
+        };
+        let mut rsize = std::mem::size_of::<AudioValueRange>() as u32;
+        let s = AudioObjectGetPropertyData(
+            dev,
+            &range_addr,
+            0,
+            null(),
+            &mut rsize,
+            &mut range as *mut _ as *mut c_void,
+        );
+        if s != 0 {
+            return Err(format!("get range: {s}"));
+        }
+        let frames = (want as f64).clamp(range.mMinimum, range.mMaximum) as u32;
+
+        let size_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMaster,
+        };
+        let s = AudioObjectSetPropertyData(
+            dev,
+            &size_addr,
+            0,
+            null(),
+            std::mem::size_of::<u32>() as u32,
+            &frames as *const _ as *const c_void,
+        );
+        if s != 0 {
+            return Err(format!("set buffer size: {s}"));
+        }
+
+        let mut got: u32 = 0;
+        let mut gsize = std::mem::size_of::<u32>() as u32;
+        let s = AudioObjectGetPropertyData(
+            dev,
+            &size_addr,
+            0,
+            null(),
+            &mut gsize,
+            &mut got as *mut _ as *mut c_void,
+        );
+        if s != 0 {
+            return Err(format!("read back: {s}"));
+        }
+        Ok(got)
+    }
 }
 
 pub fn make_button(

@@ -27,17 +27,7 @@ pub struct Editor {
     pub factory: Option<Retained<AnyObject>>,
 }
 
-pub struct AudioState {
-    pub engine: Retained<AVAudioEngine>,
-    pub player: Retained<AVAudioPlayerNode>,
-    pub pre_mixer: Retained<AVAudioMixerNode>,
-    pub chain: Vec<(usize, Retained<AVAudioUnitEffect>)>,
-    pub fade_mixer: Retained<AVAudioMixerNode>,
-    pub format: Retained<AVAudioFormat>,
-    pub start_frame: i64,
-    pub path: PathBuf,
-    pub file: Retained<AVAudioFile>,
-}
+pub use super::rt::AudioState; // not the best idea but im lazy
 
 pub struct AppIvars {
     pub field: Retained<NSTextField>,
@@ -177,6 +167,7 @@ define_class!(
 
         #[unsafe(method(onPlay:))]
         fn on_play(&self, _sender: Option<&AnyObject>) {
+            println!("on_play");
             self.finish_stop();
 
             let text = self.ivars().field.stringValue().to_string();
@@ -300,7 +291,7 @@ impl AppHandler {
         });
 
         let timer =
-            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.001, true, &block) };
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.01, true, &block) };
 
         *this.ivars().poll_timer.borrow_mut() = Some(timer);
 
@@ -351,8 +342,66 @@ impl AppHandler {
     fn apply_gain(&self) {
         let gain = self.ivars().gain.get();
         if let Some(state) = self.ivars().audio.borrow().as_ref() {
-            unsafe {
-                state.engine.mainMixerNode().setOutputVolume(gain);
+            state
+                .sh
+                .gain
+                .store(gain.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn finish_stop(&self) {
+        self.ivars().pending_playback.borrow_mut().take();
+        if let Some(timer) = self.ivars().fade.borrow_mut().take() {
+            timer.invalidate();
+        }
+        if let Some(state) = self.ivars().audio.borrow().as_ref() {
+            state.stop();
+        }
+    }
+
+    pub fn begin_fade_stop(&self) {
+        let Some(sh) = self.ivars().audio.borrow().as_ref().map(|s| s.sh.clone()) else {
+            return;
+        };
+        let this = self.retain();
+        let timer = helpers::fade_out(sh, move || this.finish_stop());
+        *self.ivars().fade.borrow_mut() = Some(timer);
+    }
+
+    fn try_start_pending_playback(&self) {
+        let ivars = self.ivars();
+        let Some((path, frame)) = ivars.pending_playback.borrow().clone() else {
+            return;
+        };
+        if ivars.audio.borrow().is_none() {
+            match rt::AudioState::new(ivars.installed.len()) {
+                Ok(a) => {
+                    println!("audio state created");
+                    *ivars.audio.borrow_mut() = Some(a);
+                    self.sync_chain();
+                }
+                Err(e) => {
+                    println!("AudioState::new failed: {e}");
+                    self.set_error(e);
+                    return;
+                }
+            }
+        }
+        let enabled = ivars.enabled.borrow().clone();
+        for (index, on) in enabled.iter().enumerate() {
+            if *on && ivars.nodes.borrow()[index].is_none() {
+                self.request_node(index);
+                return;
+            }
+        }
+        ivars.pending_playback.borrow_mut().take();
+        if let Some(state) = ivars.audio.borrow().as_ref() {
+            match helpers::play_audio(state, &path, frame) {
+                Ok(()) => {
+                    self.apply_gain();
+                    self.set_error(String::new());
+                }
+                Err(e) => self.set_error(e.to_string()),
             }
         }
     }
@@ -405,6 +454,7 @@ impl AppHandler {
     }
 
     pub fn set_effect(&self, index: usize, on: bool) {
+        let t = Instant::now();
         let ivars = self.ivars();
         {
             let mut enabled = ivars.enabled.borrow_mut();
@@ -419,6 +469,7 @@ impl AppHandler {
         if let Some(state) = ivars.audio.borrow().as_ref() {
             helpers::set_effect_enabled(state, index, on);
         }
+        println!("toggle took {:?}", t.elapsed());
     }
 
     pub fn edit_selected(&self) {
@@ -480,69 +531,10 @@ impl AppHandler {
         }
     }
 
-    pub fn finish_stop(&self) {
-        self.ivars().pending_playback.borrow_mut().take();
-        if let Some(timer) = self.ivars().fade.borrow_mut().take() {
-            timer.invalidate();
-        }
-        let state = self.ivars().audio.borrow_mut().take();
-        if let Some(state) = state {
-            helpers::teardown(&state);
-        }
-    }
-
-    pub fn begin_fade_stop(&self) {
-        if self.ivars().fade.borrow().is_some() {
-            return;
-        }
-        let Some(player) = self
-            .ivars()
-            .audio
-            .borrow()
-            .as_ref()
-            .map(|s| s.player.clone())
-        else {
-            return;
-        };
-
-        let this = self.retain();
-        let timer = helpers::fade_out(player, move || this.finish_stop());
-        *self.ivars().fade.borrow_mut() = Some(timer);
-    }
-
     fn start_playback(&self, path: &Path, frame: i64) {
+        println!("start_playback {path:?}");
         *self.ivars().pending_playback.borrow_mut() = Some((path.to_path_buf(), frame));
-
         self.try_start_pending_playback();
-    }
-
-    fn try_start_pending_playback(&self) {
-        let ivars = self.ivars();
-        if ivars.audio.borrow().is_some() {
-            return;
-        }
-        let Some((path, frame)) = ivars.pending_playback.borrow().clone() else {
-            return;
-        };
-        let enabled = ivars.enabled.borrow().clone();
-        for (index, on) in enabled.iter().enumerate() {
-            if *on && ivars.nodes.borrow()[index].is_none() {
-                self.request_node(index);
-                return;
-            }
-        }
-        ivars.pending_playback.borrow_mut().take();
-        let slots = self.loaded_slots();
-        match helpers::start_audio(&path, &slots, frame) {
-            Ok(state) => {
-                *ivars.audio.borrow_mut() = Some(state);
-                self.apply_gain();
-                self.set_error(String::new());
-            }
-            Err(error) => {
-                self.set_error(error.to_string());
-            }
-        }
     }
 
     fn poll_effects(&self) {
