@@ -1,0 +1,33 @@
+{\rtf1\ansi\deff0
+{\fonttbl{\f0 Arial;}}
+\f0\fs20
+{\b Third-Party Licenses}\par
+\par
+{{#each licenses}}
+{\b\fs24 {{{name}}} ({{{id}}})}\par
+Used by:\par
+{{#each used_by}}
+\bullet\tab {{{crate.name}}} {{{crate.version}}}\par
+{{/each}}
+\par
+{{{text}}}\par
+\page
+{{/each}}
+}
+
+{{!--
+  to generate:
+  1. cargo about init
+    a. edit about.toml and replace accepted with:
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "Zlib",
+    "ISC",
+    "Unlicense",
+    "Unicode-3.0",
+]
+  2. cargo about generate about.hbs -o LICENSE.txt
+  3. pandoc LICENSE.txt -s -o LICENSE.rtf
+--}}
