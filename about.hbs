@@ -1,19 +1,19 @@
-{\rtf1\ansi\deff0
-{\fonttbl{\f0 Arial;}}
-\f0\fs20
-{\b Third-Party Licenses}\par
-\par
+# Third-Party Licenses
+
 {{#each licenses}}
-{\b\fs24 {{{name}}} ({{{id}}})}\par
-Used by:\par
+## {{{name}}} ({{{id}}})
+
+Used by:
+
 {{#each used_by}}
-\bullet\tab {{{crate.name}}} {{{crate.version}}}\par
+- {{{crate.name}}} {{{crate.version}}}
 {{/each}}
-\par
-{{{text}}}\par
-\page
+
+~~~~text
+{{{text}}}
+~~~~
+
 {{/each}}
-}
 
 {{!--
   to generate:
