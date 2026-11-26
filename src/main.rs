@@ -11,6 +11,7 @@ fn main() {
     field.setSelectable(true);
     field.setPlaceholderString(Some(ns_string!("Path to an audio file")));
     field.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Horizontal);
+
     if field.respondsToSelector(sel!(setAllowsWritingTools:)) {
         field.setAllowsWritingTools(false);
     }
@@ -24,27 +25,53 @@ fn main() {
     search.setPlaceholderString(Some(ns_string!("Search installed effects")));
     search.setSendsSearchStringImmediately(true);
 
-    let (available_scroll, available_table) = make_list(150.0, mtm);
+    let cue_id = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    cue_id.setEditable(true);
+    cue_id.setSelectable(true);
+    cue_id.setPlaceholderString(Some(ns_string!("Cue ID")));
+    cue_id.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let cue_name = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    cue_name.setEditable(true);
+    cue_name.setSelectable(true);
+    cue_name.setPlaceholderString(Some(ns_string!("Cue Name")));
+    cue_name.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let (available_scroll, available_table) = make_list(60.0, mtm);
+    let (mid_scroll, mid_table) = make_cue_list(150.0, mtm);
 
     let error_label = make_error_label(mtm);
+
     let handler = AppHandler::new(
         mtm,
         field.clone(),
         error_label.clone(),
         search.clone(),
         available_table.clone(),
+        cue_id.clone(),
+        cue_name.clone(),
+        mid_table.clone(),
     );
 
     app.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
+
     unsafe {
+        cue_id.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
+        cue_name.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
+        field.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
+
+        mid_table.setTarget(Some(&handler));
+        mid_table.setAction(Some(sel!(onCueSelect:)));
+
         available_table.setDataSource(Some(ProtocolObject::from_ref(&*handler)));
         available_table.setTarget(Some(&handler));
         available_table.setAction(Some(sel!(onSelect:)));
         search.setTarget(Some(&handler));
         search.setAction(Some(sel!(onSearch:)));
+        mid_table.setDataSource(Some(ProtocolObject::from_ref(&*handler)));
     }
 
-    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 380.0));
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1280.0, 720.0));
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Miniaturizable
@@ -59,11 +86,15 @@ fn main() {
             false,
         )
     };
-    unsafe { window.setReleasedWhenClosed(false) };
+
+    unsafe {
+        window.setReleasedWhenClosed(false);
+    }
+
     window.setTabbingMode(NSWindowTabbingMode::Disallowed);
     window.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
     window.setTitle(ns_string!("kq"));
-    window.setContentMinSize(NSSize::new(560.0, 420.0));
+    window.setContentMinSize(NSSize::new(1280.0, 720.0));
 
     let browse_btn = make_button(ns_string!("Browse…"), &handler, sel!(onBrowse:), mtm);
     let play_btn = make_button(ns_string!("Play"), &handler, sel!(onPlay:), mtm);
@@ -71,6 +102,18 @@ fn main() {
     let edit_btn = make_button(ns_string!("Edit"), &handler, sel!(onEdit:), mtm);
     let enable_btn = make_button(ns_string!("Enable"), &handler, sel!(onEnable:), mtm);
     let disable_btn = make_button(ns_string!("Disable"), &handler, sel!(onDisable:), mtm);
+    let add_cue_btn = make_button(ns_string!("Add Cue"), &handler, sel!(onAddCue:), mtm);
+    let remove_cue_btn = make_button(ns_string!("Remove Cue"), &handler, sel!(onRemoveCue:), mtm);
+
+    let cue_row = make_stack(
+        &[
+            Retained::into_super(Retained::into_super(add_cue_btn)),
+            Retained::into_super(Retained::into_super(remove_cue_btn)),
+        ],
+        NSStackViewDistribution::FillEqually,
+        mtm,
+    );
+    cue_row.setTranslatesAutoresizingMaskIntoConstraints(false);
 
     play_btn.setKeyEquivalent(ns_string!(" "));
     stop_btn.setKeyEquivalent(ns_string!("\u{1b}"));
@@ -83,6 +126,7 @@ fn main() {
         NSStackViewDistribution::Fill,
         mtm,
     );
+
     browse_btn.setContentHuggingPriority_forOrientation(
         1000.0,
         NSLayoutConstraintOrientation::Horizontal,
@@ -125,6 +169,7 @@ fn main() {
         NSStackViewDistribution::Fill,
         mtm,
     );
+
     left_col.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     left_col.setAlignment(NSLayoutAttribute::Width);
 
@@ -151,6 +196,7 @@ fn main() {
         NSStackViewDistribution::Fill,
         mtm,
     );
+
     faders_row.setSpacing(16.0);
     faders_row.setTranslatesAutoresizingMaskIntoConstraints(false);
     levels_content.addSubview(&faders_row);
@@ -169,21 +215,10 @@ fn main() {
 
     file_row.setTranslatesAutoresizingMaskIntoConstraints(false);
 
-    let cue_id = NSTextField::textFieldWithString(&NSString::new(), mtm);
-    cue_id.setEditable(true);
-    cue_id.setSelectable(true);
-    cue_id.setPlaceholderString(Some(ns_string!("Cue ID")));
-    cue_id.setTranslatesAutoresizingMaskIntoConstraints(false);
-
-    let cue_name = NSTextField::textFieldWithString(&NSString::new(), mtm);
-    cue_name.setEditable(true);
-    cue_name.setSelectable(true);
-    cue_name.setPlaceholderString(Some(ns_string!("Cue Name")));
-    cue_name.setTranslatesAutoresizingMaskIntoConstraints(false);
-
     description_content.addSubview(&file_row);
     description_content.addSubview(&cue_id);
     description_content.addSubview(&cue_name);
+    description_content.addSubview(&cue_row);
 
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
         file_row
@@ -217,6 +252,13 @@ fn main() {
             .widthAnchor()
             .constraintEqualToAnchor_multiplier(&cue_name.widthAnchor(), 0.2),
         browse_btn.widthAnchor().constraintEqualToConstant(90.0),
+        cue_row
+            .leadingAnchor()
+            .constraintEqualToAnchor(&description_content.leadingAnchor()),
+        cue_row
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&cue_id.bottomAnchor(), 12.0),
+        cue_row.widthAnchor().constraintEqualToConstant(200.0),
     ]));
 
     let levels_tab_content = padded_tab_content(&levels_content, 16.0, mtm);
@@ -262,10 +304,14 @@ fn main() {
 
     button_row
         .setContentHuggingPriority_forOrientation(1000.0, NSLayoutConstraintOrientation::Vertical);
+
     button_row.setContentCompressionResistancePriority_forOrientation(
         1000.0,
         NSLayoutConstraintOrientation::Vertical,
     );
+
+    mid_scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
+    content.addSubview(&mid_scroll);
 
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
         button_row
@@ -296,6 +342,21 @@ fn main() {
         tabs.heightAnchor().constraintEqualToConstant(240.0),
         tabs.topAnchor()
             .constraintGreaterThanOrEqualToAnchor_constant(&button_row.bottomAnchor(), 14.0),
+        mid_scroll
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&button_row.bottomAnchor(), 14.0),
+        mid_scroll
+            .bottomAnchor()
+            .constraintEqualToAnchor_constant(&tabs.topAnchor(), -14.0),
+        mid_scroll
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&content.leadingAnchor(), 20.0),
+        mid_scroll
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&content.trailingAnchor(), -20.0),
+        mid_scroll
+            .heightAnchor()
+            .constraintGreaterThanOrEqualToConstant(60.0),
     ]));
 
     content.layoutSubtreeIfNeeded();
@@ -312,6 +373,7 @@ fn main() {
     menubar.addItem(&app_item);
 
     let app_menu = NSMenu::new(mtm);
+
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
@@ -320,11 +382,13 @@ fn main() {
             ns_string!("q"),
         )
     };
+
     app_menu.addItem(&quit_item);
     app_item.setSubmenu(Some(&app_menu));
     app.setMainMenu(Some(&menubar));
 
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
+
     app.run();
 }

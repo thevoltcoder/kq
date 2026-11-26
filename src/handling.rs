@@ -27,7 +27,7 @@ pub struct Editor {
     pub factory: Option<Retained<AnyObject>>,
 }
 
-pub use super::rt::AudioState; // not the best idea but im lazy
+pub use super::rt::AudioState;
 
 pub struct AppIvars {
     pub field: Retained<NSTextField>,
@@ -47,11 +47,17 @@ pub struct AppIvars {
     pub loading: RefCell<Vec<bool>>,
     pub effect_tx: std::sync::mpsc::Sender<(usize, Result<usize, String>)>,
     pub effect_rx: RefCell<std::sync::mpsc::Receiver<(usize, Result<usize, String>)>>,
-    pub pending_playback: RefCell<Option<(PathBuf, i64)>>,
+    pub pending_playback: RefCell<VecDeque<(PathBuf, i64)>>,
     pub pending_editor: Cell<Option<usize>>,
     pub poll_timer: RefCell<Option<Retained<NSTimer>>>,
     pub rebuild_at: Cell<Option<std::time::Instant>>,
     pub termination_confirmed: Cell<bool>,
+    pub cue_id: Retained<NSTextField>,
+    pub cue_name: Retained<NSTextField>,
+    pub cue_table: Retained<NSTableView>,
+    pub cues: RefCell<Vec<cue::Cue>>,
+    pub active_cue: Cell<usize>,
+    pub initial_cue_selection: Cell<bool>,
 }
 
 define_class!(
@@ -62,6 +68,8 @@ define_class!(
     pub struct AppHandler;
 
     unsafe impl NSObjectProtocol for AppHandler {}
+
+    unsafe impl NSTextFieldDelegate for AppHandler {}
 
     unsafe impl NSApplicationDelegate for AppHandler {
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
@@ -98,13 +106,23 @@ define_class!(
 
     unsafe impl NSWindowDelegate for AppHandler {}
 
+    unsafe impl NSControlTextEditingDelegate for AppHandler {
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.update_selected_cue();
+        }
+    }
+
     unsafe impl NSTableViewDataSource for AppHandler {
         #[unsafe(method(numberOfRowsInTableView:))]
         fn number_of_rows_in_table_view(&self, table: &NSTableView) -> NSInteger {
-            if std::ptr::eq(table, &*self.ivars().available_table) {
-                self.ivars().filtered.borrow().len() as NSInteger
+            let ivars = self.ivars();
+            if std::ptr::eq(table, &*ivars.cue_table) {
+                ivars.cues.borrow().len() as NSInteger
+            } else if std::ptr::eq(table, &*ivars.available_table) {
+                ivars.filtered.borrow().len() as NSInteger
             } else {
-                self.ivars().installed.len() as NSInteger
+                ivars.installed.len() as NSInteger
             }
         }
 
@@ -112,10 +130,23 @@ define_class!(
         fn table_view_object_value(
             &self,
             table: &NSTableView,
-            _column: Option<&NSTableColumn>,
+            column: Option<&NSTableColumn>,
             row: NSInteger,
         ) -> *mut NSObject {
             let ivars = self.ivars();
+            if std::ptr::eq(table, &*ivars.cue_table) {
+                let cues = ivars.cues.borrow();
+                let Some(cue) = cues.get(row as usize) else {
+                    return std::ptr::null_mut();
+                };
+                let text = match column.map(|c| c.identifier().to_string()).as_deref() {
+                    Some("id") => cue.id.clone(),
+                    Some("name") => cue.name.clone(),
+                    Some("duration") => helpers::format_duration(cue.duration),
+                    _ => return std::ptr::null_mut(),
+                };
+                return Retained::autorelease_ptr(NSString::from_str(&text)) as *mut NSObject;
+            }
             let index = if std::ptr::eq(table, &*ivars.available_table) {
                 ivars.filtered.borrow().get(row as usize).copied()
             } else {
@@ -167,16 +198,26 @@ define_class!(
 
         #[unsafe(method(onPlay:))]
         fn on_play(&self, _sender: Option<&AnyObject>) {
-            println!("on_play");
-            self.finish_stop();
+            let ivars = self.ivars();
+            let index = ivars.active_cue.get();
 
-            let text = self.ivars().field.stringValue().to_string();
-            let path = PathBuf::from(text.trim());
-            if !helpers::is_audio_path(&path) {
-                self.set_error(format!("Not a supported audio file: {}", path.display()));
+            let Some(cue) = ivars.cues.borrow().get(index).cloned() else {
+                return;
+            };
+
+            if !helpers::is_audio_path(&cue.path) {
+                self.set_error(format!("Cue {} has no valid audio file", index + 1));
                 return;
             }
-            self.start_playback(&path, 0);
+
+            self.start_playback(&cue.path, 0);
+
+            let next = (index + 1).min(ivars.cues.borrow().len() - 1);
+            ivars.active_cue.set(next);
+
+            let selected = NSIndexSet::indexSetWithIndex(next);
+            ivars.cue_table.selectRowIndexes_byExtendingSelection(&selected, false);
+            self.load_selected_cue();
         }
 
         #[unsafe(method(onStop:))]
@@ -237,6 +278,27 @@ define_class!(
             if let Some(path) = dialog.pick_file() {
                 field.setStringValue(&NSString::from_str(&path.to_string_lossy()));
             }
+            self.update_selected_cue();
+        }
+
+        #[unsafe(method(onAddCue:))]
+        fn on_add_cue(&self, _sender: Option<&AnyObject>) {
+            self.add_cue();
+        }
+
+        #[unsafe(method(onRemoveCue:))]
+        fn on_remove_cue(&self, _sender: Option<&AnyObject>) {
+            self.remove_cue();
+        }
+
+        #[unsafe(method(onSaveCue:))]
+        fn on_save_cue(&self, _sender: Option<&AnyObject>) {
+            self.save_cue();
+        }
+
+        #[unsafe(method(onCueSelect:))]
+        fn on_cue_select(&self, _sender: Option<&AnyObject>) {
+            self.load_selected_cue();
         }
     }
 );
@@ -248,6 +310,9 @@ impl AppHandler {
         error_label: Retained<NSTextField>,
         search: Retained<NSSearchField>,
         available_table: Retained<NSTableView>,
+        cue_id: Retained<NSTextField>,
+        cue_name: Retained<NSTextField>,
+        cue_table: Retained<NSTableView>,
     ) -> Retained<Self> {
         let installed = helpers::list_installed_effects();
         let filtered = (0..installed.len()).collect();
@@ -267,7 +332,7 @@ impl AppHandler {
             loading: RefCell::new(loading),
             effect_tx,
             effect_rx: RefCell::new(effect_rx),
-            pending_playback: RefCell::new(None),
+            pending_playback: RefCell::new(VecDeque::new()),
             pending_editor: Cell::new(None),
             poll_timer: RefCell::new(None),
             filtered: RefCell::new(filtered),
@@ -280,6 +345,17 @@ impl AppHandler {
             gain_r: Cell::new(1.0),
             rebuild_at: Cell::new(None),
             termination_confirmed: Cell::new(false),
+            cue_id,
+            cue_name,
+            cue_table,
+            cues: RefCell::new(vec![cue::Cue {
+                id: String::new(),
+                name: String::new(),
+                path: PathBuf::new(),
+                duration: 0.0,
+            }]),
+            active_cue: Cell::new(0),
+            initial_cue_selection: Cell::new(false),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -300,6 +376,31 @@ impl AppHandler {
         }
 
         this
+    }
+
+    fn ensure_initial_cue_selection(&self) {
+        let ivars = self.ivars();
+
+        if ivars.initial_cue_selection.get() {
+            return;
+        }
+
+        if ivars.cues.borrow().is_empty() {
+            return;
+        }
+
+        ivars.cue_table.reloadData();
+
+        let selected = NSIndexSet::indexSetWithIndex(0);
+        ivars
+            .cue_table
+            .selectRowIndexes_byExtendingSelection(&selected, false);
+
+        if ivars.cue_table.selectedRow() == 0 {
+            ivars.active_cue.set(0);
+            ivars.initial_cue_selection.set(true);
+            self.load_selected_cue();
+        }
     }
 
     fn confirm_close(&self) -> bool {
@@ -350,7 +451,7 @@ impl AppHandler {
     }
 
     pub fn finish_stop(&self) {
-        self.ivars().pending_playback.borrow_mut().take();
+        self.ivars().pending_playback.borrow_mut().clear();
         if let Some(timer) = self.ivars().fade.borrow_mut().take() {
             timer.invalidate();
         }
@@ -370,7 +471,7 @@ impl AppHandler {
 
     fn try_start_pending_playback(&self) {
         let ivars = self.ivars();
-        let Some((path, frame)) = ivars.pending_playback.borrow().clone() else {
+        let Some((path, frame)) = ivars.pending_playback.borrow_mut().pop_front() else {
             return;
         };
         if ivars.audio.borrow().is_none() {
@@ -391,10 +492,13 @@ impl AppHandler {
         for (index, on) in enabled.iter().enumerate() {
             if *on && ivars.nodes.borrow()[index].is_none() {
                 self.request_node(index);
+                ivars
+                    .pending_playback
+                    .borrow_mut()
+                    .push_front((path, frame));
                 return;
             }
         }
-        ivars.pending_playback.borrow_mut().take();
         if let Some(state) = ivars.audio.borrow().as_ref() {
             match helpers::play_audio(state, &path, frame) {
                 Ok(()) => {
@@ -533,11 +637,16 @@ impl AppHandler {
 
     fn start_playback(&self, path: &Path, frame: i64) {
         println!("start_playback {path:?}");
-        *self.ivars().pending_playback.borrow_mut() = Some((path.to_path_buf(), frame));
+        self.ivars()
+            .pending_playback
+            .borrow_mut()
+            .push_back((path.to_path_buf(), frame));
         self.try_start_pending_playback();
     }
 
     fn poll_effects(&self) {
+        self.ensure_initial_cue_selection();
+
         loop {
             let result = self.ivars().effect_rx.borrow().try_recv();
 
@@ -578,7 +687,7 @@ impl AppHandler {
                 }
 
                 Err(error) => {
-                    self.ivars().pending_playback.borrow_mut().take();
+                    self.ivars().pending_playback.borrow_mut().clear();
 
                     if self.ivars().pending_editor.get() == Some(index) {
                         self.ivars().pending_editor.set(None);
@@ -635,6 +744,182 @@ impl AppHandler {
         for (index, node, on) in &slots {
             helpers::insert_effect(state, *index, node, *on);
         }
+    }
+
+    fn add_cue(&self) {
+        let ivars = self.ivars();
+        let mut cues = ivars.cues.borrow_mut();
+
+        cues.push(cue::Cue {
+            id: String::new(),
+            name: String::new(),
+            path: PathBuf::new(),
+            duration: 0.0,
+        });
+
+        let index = cues.len() - 1;
+        drop(cues);
+
+        ivars.active_cue.set(index);
+        ivars.cue_table.reloadData();
+
+        let selected = NSIndexSet::indexSetWithIndex(index);
+        ivars
+            .cue_table
+            .selectRowIndexes_byExtendingSelection(&selected, false);
+
+        ivars.cue_id.setStringValue(&NSString::new());
+        ivars.cue_name.setStringValue(&NSString::new());
+        ivars.field.setStringValue(&NSString::new());
+
+        self.set_error(String::new());
+    }
+
+    fn remove_cue(&self) {
+        let ivars = self.ivars();
+        let row = ivars.cue_table.selectedRow();
+
+        if row < 0 {
+            return;
+        }
+
+        let mut cues = ivars.cues.borrow_mut();
+
+        if cues.len() <= 1 {
+            self.set_error("You must always have at least one cue".to_string());
+            return;
+        }
+
+        let row = row as usize;
+        if row >= cues.len() {
+            return;
+        }
+
+        cues.remove(row);
+
+        let active = ivars.active_cue.get();
+        let next_active = if row < active {
+            active - 1
+        } else {
+            active.min(cues.len() - 1)
+        };
+
+        drop(cues);
+
+        ivars.active_cue.set(next_active);
+        ivars.cue_table.reloadData();
+
+        let selected = NSIndexSet::indexSetWithIndex(next_active);
+        ivars
+            .cue_table
+            .selectRowIndexes_byExtendingSelection(&selected, false);
+
+        self.load_selected_cue();
+        self.set_error(String::new());
+    }
+
+    fn save_cue(&self) {
+        let ivars = self.ivars();
+        let row = ivars.active_cue.get();
+
+        let id = ivars.cue_id.stringValue().to_string().trim().to_string();
+        let name = ivars.cue_name.stringValue().to_string().trim().to_string();
+        let path = PathBuf::from(ivars.field.stringValue().to_string().trim());
+
+        if id.is_empty() {
+            self.set_error("Cue ID is required".to_string());
+            return;
+        }
+
+        if !helpers::is_audio_path(&path) {
+            self.set_error(format!("Not a supported audio file: {}", path.display()));
+            return;
+        }
+
+        let duration = match helpers::audio_duration(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.set_error(e.to_string());
+                return;
+            }
+        };
+
+        let mut cues = ivars.cues.borrow_mut();
+
+        if row >= cues.len() {
+            return;
+        }
+
+        if cues
+            .iter()
+            .enumerate()
+            .any(|(i, cue)| i != row && cue.id == id)
+        {
+            self.set_error(format!("Cue ID {id} already exists"));
+            return;
+        }
+
+        cues[row] = cue::Cue {
+            id,
+            name,
+            path,
+            duration,
+        };
+
+        drop(cues);
+
+        ivars.cue_table.reloadData();
+        self.set_error(String::new());
+    }
+
+    fn update_selected_cue(&self) {
+        let ivars = self.ivars();
+        let row = ivars.active_cue.get();
+
+        let id = ivars.cue_id.stringValue().to_string();
+        let name = ivars.cue_name.stringValue().to_string();
+        let path = PathBuf::from(ivars.field.stringValue().to_string());
+
+        let duration = if helpers::is_audio_path(&path) {
+            helpers::audio_duration(&path).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let mut cues = ivars.cues.borrow_mut();
+
+        if let Some(cue) = cues.get_mut(row) {
+            cue.id = id;
+            cue.name = name;
+            cue.path = path;
+            cue.duration = duration;
+        }
+
+        drop(cues);
+        ivars.cue_table.reloadData();
+    }
+
+    fn load_selected_cue(&self) {
+        let ivars = self.ivars();
+        let row = ivars.active_cue.get();
+        let cue = {
+            let cues = ivars.cues.borrow();
+            let Some(cue) = cues.get(row) else {
+                return;
+            };
+            cue.clone()
+        };
+
+        ivars.active_cue.set(row);
+        ivars.cue_id.setStringValue(&NSString::from_str(&cue.id));
+        ivars
+            .cue_name
+            .setStringValue(&NSString::from_str(&cue.name));
+        ivars
+            .field
+            .setStringValue(&NSString::from_str(&cue.path.to_string_lossy()));
+
+        self.set_error(String::new());
     }
 }
 

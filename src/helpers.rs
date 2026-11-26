@@ -261,7 +261,7 @@ pub fn instantiate_effect_async(
     }
 }
 
-fn open_audio_file(file_path: &Path) -> anyhow::Result<Retained<AVAudioFile>> {
+pub fn open_audio_file(file_path: &Path) -> anyhow::Result<Retained<AVAudioFile>> {
     let url = NSURL::from_file_path(file_path).context("invalid audio file path")?;
     let allocated = AVAudioFile::alloc();
     let mut error: *mut NSError = std::ptr::null_mut();
@@ -401,8 +401,9 @@ pub fn make_list(
     scroll.setBorderType(NSBorderType::BezelBorder);
     scroll
         .heightAnchor()
-        .constraintEqualToConstant(height)
+        .constraintGreaterThanOrEqualToConstant(height)
         .setActive(true);
+    scroll.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Vertical);
     (scroll, table)
 }
 
@@ -490,4 +491,49 @@ pub fn padded_tab_content(view: &NSView, inset: f64, mtm: MainThreadMarker) -> R
     ]));
 
     container
+}
+
+pub fn audio_duration(path: &Path) -> anyhow::Result<f64> {
+    let file = open_audio_file(path)?;
+    let (len, rate) = unsafe { (file.length() as f64, file.processingFormat().sampleRate()) };
+    Ok(len / rate)
+}
+
+pub fn format_duration(secs: f64) -> String {
+    let ms = (secs * 1000.0).round() as u64;
+    format!("{}:{:02}.{:03}", ms / 60000, (ms / 1000) % 60, ms % 1000)
+}
+
+pub fn make_cue_list(
+    height: f64,
+    mtm: MainThreadMarker,
+) -> (Retained<NSScrollView>, Retained<NSTableView>) {
+    let table = NSTableView::new(mtm);
+    for (ident, title, width) in [
+        (ns_string!("id"), ns_string!("ID"), 80.0),
+        (ns_string!("name"), ns_string!("Name"), 240.0),
+        (ns_string!("duration"), ns_string!("Duration"), 90.0),
+    ] {
+        let column = NSTableColumn::initWithIdentifier(mtm.alloc::<NSTableColumn>(), ident);
+        column.setTitle(title);
+        column.setWidth(width);
+        column.setResizingMask(NSTableColumnResizingOptions::AutoresizingMask);
+        table.addTableColumn(&column);
+    }
+    table.setColumnAutoresizingStyle(
+        NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
+    );
+    table.setAllowsEmptySelection(true);
+    table.setAllowsMultipleSelection(false);
+
+    let scroll = NSScrollView::new(mtm);
+    scroll.setDocumentView(Some(&table));
+    scroll.setHasVerticalScroller(true);
+    scroll.setBorderType(NSBorderType::BezelBorder);
+    scroll
+        .heightAnchor()
+        .constraintGreaterThanOrEqualToConstant(height)
+        .setActive(true);
+    scroll.setContentHuggingPriority_forOrientation(1.0, NSLayoutConstraintOrientation::Vertical);
+    (scroll, table)
 }

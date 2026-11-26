@@ -7,10 +7,12 @@ pub use objc2_avf_audio::*;
 pub use objc2_core_audio_kit::*;
 pub use objc2_foundation::*;
 pub use std::{
-    cell::{Cell, OnceCell, RefCell},
+    cell::{Cell, OnceCell, RefCell, UnsafeCell},
+    collections::VecDeque,
     ffi::c_void,
     path::{Path, PathBuf},
-    ptr::{NonNull, null, null_mut},
+    ptr::{NonNull, copy_nonoverlapping, null, null_mut},
+    sync::{Arc, Mutex, atomic::*},
     time::Instant,
 };
 
@@ -20,6 +22,7 @@ const FADE_TICK_SECS: f64 = 1.0 / 60.0;
 const AUDIO_EXTS: &[&str] = &["wav", "mp3", "m4a", "aac", "aif", "aiff", "caf", "flac"];
 const COCOA_UI_PROPERTY: u32 = 31;
 
+pub mod cue;
 pub mod custom;
 pub mod handling;
 pub mod helpers;
