@@ -307,6 +307,23 @@ fn main() {
     content.layoutSubtreeIfNeeded();
     tabs.layoutSubtreeIfNeeded();
 
+    let menubar = NSMenu::new(mtm);
+    let app_item = NSMenuItem::new(mtm);
+    menubar.addItem(&app_item);
+
+    let app_menu = NSMenu::new(mtm);
+    let quit_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            ns_string!("Quit kq"),
+            Some(sel!(terminate:)),
+            ns_string!("q"),
+        )
+    };
+    app_menu.addItem(&quit_item);
+    app_item.setSubmenu(Some(&app_menu));
+    app.setMainMenu(Some(&menubar));
+
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
     app.run();
