@@ -63,7 +63,7 @@ fn main() {
     window.setTabbingMode(NSWindowTabbingMode::Disallowed);
     window.setDelegate(Some(ProtocolObject::from_ref(&*handler)));
     window.setTitle(ns_string!("kq"));
-    window.setContentMinSize(NSSize::new(560.0, 340.0));
+    window.setContentMinSize(NSSize::new(560.0, 420.0));
 
     let browse_btn = make_button(ns_string!("Browse…"), &handler, sel!(onBrowse:), mtm);
     let play_btn = make_button(ns_string!("Play"), &handler, sel!(onPlay:), mtm);
@@ -101,7 +101,6 @@ fn main() {
         &[
             Retained::into_super(Retained::into_super(play_btn)),
             Retained::into_super(Retained::into_super(stop_btn)),
-            Retained::into_super(Retained::into_super(edit_btn)),
         ],
         NSStackViewDistribution::FillEqually,
         mtm,
@@ -111,6 +110,7 @@ fn main() {
         &[
             Retained::into_super(Retained::into_super(enable_btn)),
             Retained::into_super(Retained::into_super(disable_btn)),
+            Retained::into_super(Retained::into_super(edit_btn)),
         ],
         NSStackViewDistribution::FillEqually,
         mtm,
@@ -244,45 +244,58 @@ fn main() {
     error_label
         .setContentHuggingPriority_forOrientation(750.0, NSLayoutConstraintOrientation::Vertical);
 
-    let root = make_stack(
-        &[
-            Retained::into_super(button_row.clone()),
-            Retained::into_super(tabs.clone()),
-            Retained::into_super(Retained::into_super(error_label.clone())),
-        ],
-        NSStackViewDistribution::Fill,
-        mtm,
-    );
-    root.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-    root.setSpacing(14.0);
-    root.setTranslatesAutoresizingMaskIntoConstraints(false);
-
     let background: Retained<BackgroundView> =
         unsafe { msg_send![mtm.alloc::<BackgroundView>(), init] };
 
     window.setContentView(Some(&background));
 
     let content: &NSView = &background;
-    content.addSubview(&root);
+
+    for v in [
+        button_row.as_ref() as &NSView,
+        tabs.as_ref() as &NSView,
+        error_label.as_ref() as &NSView,
+    ] {
+        v.setTranslatesAutoresizingMaskIntoConstraints(false);
+        content.addSubview(v);
+    }
+
+    button_row
+        .setContentHuggingPriority_forOrientation(1000.0, NSLayoutConstraintOrientation::Vertical);
+    button_row.setContentCompressionResistancePriority_forOrientation(
+        1000.0,
+        NSLayoutConstraintOrientation::Vertical,
+    );
 
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-        root.leadingAnchor()
-            .constraintEqualToAnchor_constant(&content.leadingAnchor(), 20.0),
-        root.trailingAnchor()
-            .constraintEqualToAnchor_constant(&content.trailingAnchor(), -20.0),
-        root.topAnchor()
-            .constraintEqualToAnchor_constant(&content.topAnchor(), 20.0),
-        root.bottomAnchor()
-            .constraintEqualToAnchor_constant(&content.bottomAnchor(), -20.0),
         button_row
-            .widthAnchor()
-            .constraintEqualToAnchor(&root.widthAnchor()),
-        tabs.widthAnchor()
-            .constraintEqualToAnchor(&root.widthAnchor()),
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&content.topAnchor(), 20.0),
+        button_row
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&content.leadingAnchor(), 20.0),
+        button_row
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&content.trailingAnchor(), -20.0),
         error_label
-            .widthAnchor()
-            .constraintEqualToAnchor(&root.widthAnchor()),
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&content.leadingAnchor(), 20.0),
+        error_label
+            .trailingAnchor()
+            .constraintEqualToAnchor_constant(&content.trailingAnchor(), -20.0),
+        error_label
+            .bottomAnchor()
+            .constraintEqualToAnchor_constant(&content.bottomAnchor(), -20.0),
         error_label.heightAnchor().constraintEqualToConstant(36.0),
+        tabs.leadingAnchor()
+            .constraintEqualToAnchor_constant(&content.leadingAnchor(), 20.0),
+        tabs.trailingAnchor()
+            .constraintEqualToAnchor_constant(&content.trailingAnchor(), -20.0),
+        tabs.bottomAnchor()
+            .constraintEqualToAnchor_constant(&error_label.topAnchor(), -14.0),
+        tabs.heightAnchor().constraintEqualToConstant(240.0),
+        tabs.topAnchor()
+            .constraintGreaterThanOrEqualToAnchor_constant(&button_row.bottomAnchor(), 14.0),
     ]));
 
     content.layoutSubtreeIfNeeded();
