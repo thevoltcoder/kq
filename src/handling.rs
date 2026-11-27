@@ -377,9 +377,7 @@ define_class!(
             if row < 0 {
                 return;
             }
-
             self.update_selected_cue();
-
             ivars.active_cue.set(row as usize);
             self.load_selected_cue();
         }
@@ -1134,26 +1132,20 @@ impl AppHandler {
 
     fn remove_cue(&self) {
         let ivars = self.ivars();
-        let row = ivars.cue_table.selectedRow();
-
-        if row < 0 {
-            return;
-        }
+        self.update_selected_cue();
 
         let mut cues = ivars.cues.borrow_mut();
-
         if cues.len() <= 1 {
             self.set_error("You must always have at least one cue".to_string());
             return;
         }
 
-        let row = row as usize;
+        let row = ivars.active_cue.get();
         if row >= cues.len() {
             return;
         }
 
         cues.remove(row);
-
         if let Some(p) = ivars.playing_cue.get() {
             if p == row {
                 ivars.playing_cue.set(None);
@@ -1161,19 +1153,11 @@ impl AppHandler {
                 ivars.playing_cue.set(Some(p - 1));
             }
         }
-
-        let active = ivars.active_cue.get();
-        let next_active = if row < active {
-            active - 1
-        } else {
-            active.min(cues.len() - 1)
-        };
-
+        let next_active = row.min(cues.len() - 1);
         drop(cues);
 
         ivars.active_cue.set(next_active);
         ivars.cue_table.reloadData();
-
         let selected = NSIndexSet::indexSetWithIndex(next_active);
         ivars
             .cue_table
@@ -1321,22 +1305,23 @@ impl AppHandler {
     fn update_selected_cue(&self) {
         let ivars = self.ivars();
         let row = ivars.active_cue.get();
-
         let id = ivars.cue_id.stringValue().to_string();
         let name = ivars.cue_name.stringValue().to_string();
-
+        let auto_continue = match ivars.auto_continue.indexOfSelectedItem() {
+            1 => cue::AutoContinue::Continue,
+            2 => cue::AutoContinue::Follow,
+            _ => cue::AutoContinue::None,
+        };
         let is_fade = ivars
             .cues
             .borrow()
             .get(row)
             .is_some_and(|cue| cue.fade_target.is_some());
-
         let mut cues = ivars.cues.borrow_mut();
-
         if let Some(cue) = cues.get_mut(row) {
             cue.id = id;
             cue.name = name;
-
+            cue.auto_continue = auto_continue;
             if is_fade {
                 cue.fade_target = Some(
                     ivars
@@ -1346,7 +1331,6 @@ impl AppHandler {
                         .trim()
                         .to_string(),
                 );
-
                 cue.duration = ivars
                     .cue_duration
                     .stringValue()
@@ -1354,13 +1338,7 @@ impl AppHandler {
                     .trim()
                     .parse::<f64>()
                     .unwrap_or(0.0);
-
                 cue.stop_after_fade = ivars.stop_after_fade.indexOfSelectedItem() == 0;
-                cue.auto_continue = match ivars.auto_continue.indexOfSelectedItem() {
-                    1 => cue::AutoContinue::Continue,
-                    2 => cue::AutoContinue::Follow,
-                    _ => cue::AutoContinue::None,
-                };
             } else {
                 let path = PathBuf::from(ivars.field.stringValue().to_string());
                 cue.duration = if helpers::is_audio_path(&path) {
@@ -1371,7 +1349,6 @@ impl AppHandler {
                 cue.path = path;
             }
         }
-
         drop(cues);
         ivars.cue_table.reloadData();
     }
@@ -1389,6 +1366,7 @@ impl AppHandler {
         };
 
         let is_fade = cue.fade_target.is_some();
+        ivars.stop_after_fade.setEnabled(is_fade);
 
         ivars.active_cue.set(row);
         ivars.cue_id.setStringValue(&NSString::from_str(&cue.id));

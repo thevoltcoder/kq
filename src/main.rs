@@ -64,7 +64,6 @@ fn main() {
 
     let (available_scroll, available_table) = make_list(60.0, mtm);
     let (mid_scroll, mid_table) = make_cue_list(150.0, mtm);
-
     let error_label = make_error_label(mtm);
 
     let handler = AppHandler::new(
@@ -103,7 +102,6 @@ fn main() {
 
         stop_after_fade.setTarget(Some(&*handler));
         stop_after_fade.setAction(Some(sel!(onCueOptionsChanged:)));
-
         auto_continue.setTarget(Some(&*handler));
         auto_continue.setAction(Some(sel!(onCueOptionsChanged:)));
     }
@@ -139,7 +137,6 @@ fn main() {
     let edit_btn = make_button(ns_string!("Edit"), &handler, sel!(onEdit:), mtm);
     let enable_btn = make_button(ns_string!("Enable"), &handler, sel!(onEnable:), mtm);
     let disable_btn = make_button(ns_string!("Disable"), &handler, sel!(onDisable:), mtm);
-
     let add_cue_btn = make_button(ns_string!("Add Cue"), &handler, sel!(onAddCue:), mtm);
     let add_fade_cue_btn = make_button(
         ns_string!("Add Fade Cue"),
@@ -148,29 +145,6 @@ fn main() {
         mtm,
     );
     let remove_cue_btn = make_button(ns_string!("Remove Cue"), &handler, sel!(onRemoveCue:), mtm);
-
-    let cue_add_row = make_stack(
-        &[
-            Retained::into_super(Retained::into_super(add_cue_btn)),
-            Retained::into_super(Retained::into_super(add_fade_cue_btn)),
-        ],
-        NSStackViewDistribution::FillEqually,
-        mtm,
-    );
-    cue_add_row.setSpacing(8.0);
-    cue_add_row.setTranslatesAutoresizingMaskIntoConstraints(false);
-
-    let cue_row = make_stack(
-        &[
-            Retained::into_super(cue_add_row),
-            Retained::into_super(Retained::into_super(remove_cue_btn)),
-        ],
-        NSStackViewDistribution::FillEqually,
-        mtm,
-    );
-    cue_row.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-    cue_row.setSpacing(8.0);
-    cue_row.setTranslatesAutoresizingMaskIntoConstraints(false);
 
     play_btn.setKeyEquivalent(ns_string!(" "));
     stop_btn.setKeyEquivalent(ns_string!("\u{1b}"));
@@ -193,7 +167,6 @@ fn main() {
         1000.0,
         NSLayoutConstraintOrientation::Horizontal,
     );
-
     field.setContentCompressionResistancePriority_forOrientation(
         250.0,
         NSLayoutConstraintOrientation::Horizontal,
@@ -203,6 +176,9 @@ fn main() {
         &[
             Retained::into_super(Retained::into_super(play_btn)),
             Retained::into_super(Retained::into_super(stop_btn)),
+            Retained::into_super(Retained::into_super(add_cue_btn)),
+            Retained::into_super(Retained::into_super(add_fade_cue_btn)),
+            Retained::into_super(Retained::into_super(remove_cue_btn)),
         ],
         NSStackViewDistribution::FillEqually,
         mtm,
@@ -227,7 +203,6 @@ fn main() {
         NSStackViewDistribution::Fill,
         mtm,
     );
-
     left_col.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     left_col.setAlignment(NSLayoutAttribute::Width);
 
@@ -263,7 +238,6 @@ fn main() {
         NSStackViewDistribution::Fill,
         mtm,
     );
-
     faders_row.setSpacing(16.0);
     faders_row.setTranslatesAutoresizingMaskIntoConstraints(false);
     levels_content.addSubview(&faders_row);
@@ -312,7 +286,6 @@ fn main() {
     description_content.addSubview(&cue_name);
     description_content.addSubview(&fade_row);
     description_content.addSubview(&behavior_row);
-    description_content.addSubview(&cue_row);
 
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
         file_row
@@ -364,13 +337,6 @@ fn main() {
         behavior_row
             .topAnchor()
             .constraintEqualToAnchor_constant(&fade_row.bottomAnchor(), 12.0),
-        cue_row
-            .leadingAnchor()
-            .constraintEqualToAnchor(&description_content.leadingAnchor()),
-        cue_row
-            .topAnchor()
-            .constraintEqualToAnchor_constant(&behavior_row.bottomAnchor(), 12.0),
-        cue_row.widthAnchor().constraintEqualToConstant(360.0),
     ]));
 
     let levels_tab_content = padded_tab_content(&levels_content, 16.0, mtm);
@@ -402,7 +368,6 @@ fn main() {
         unsafe { msg_send![mtm.alloc::<BackgroundView>(), init] };
 
     window.setContentView(Some(&background));
-
     let content: &NSView = &background;
 
     for v in [
@@ -416,7 +381,6 @@ fn main() {
 
     button_row
         .setContentHuggingPriority_forOrientation(1000.0, NSLayoutConstraintOrientation::Vertical);
-
     button_row.setContentCompressionResistancePriority_forOrientation(
         1000.0,
         NSLayoutConstraintOrientation::Vertical,
@@ -485,7 +449,6 @@ fn main() {
     menubar.addItem(&app_item);
 
     let app_menu = NSMenu::new(mtm);
-
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
