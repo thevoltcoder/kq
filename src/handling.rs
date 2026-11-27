@@ -738,24 +738,26 @@ impl AppHandler {
 
     fn try_start_pending_playback(&self) {
         let ivars = self.ivars();
+
         let Some((path, frame, key)) = ivars.pending_playback.borrow_mut().pop_front() else {
             return;
         };
+
         if ivars.audio.borrow().is_none() {
             match rt::AudioState::new(ivars.installed.len()) {
                 Ok(a) => {
-                    println!("audio state created");
                     *ivars.audio.borrow_mut() = Some(a);
                     self.sync_chain();
                 }
                 Err(e) => {
-                    println!("AudioState::new failed: {e}");
                     self.set_error(e);
                     return;
                 }
             }
         }
+
         let enabled = ivars.chain.borrow().clone();
+
         for (index, on) in enabled.iter().enumerate() {
             if *on && ivars.nodes.borrow()[index].is_none() {
                 self.request_node(index);
@@ -766,17 +768,43 @@ impl AppHandler {
                 return;
             }
         }
-        if let Some(state) = ivars.audio.borrow().as_ref() {
+
+        let cue_index = {
+            let cues = ivars.cues.borrow();
+            cues.iter().position(|cue| cue_key(cue) == key)
+        };
+
+        let started = {
+            let audio = ivars.audio.borrow();
+            let Some(state) = audio.as_ref() else {
+                return;
+            };
+
             state.set_next_fx(&enabled);
             state.set_next_key(key);
+
             match helpers::play_audio(state, &path, frame) {
                 Ok(()) => {
-                    if let Some(index) = ivars.playing_cue.get() {
+                    if let Some(index) = cue_index {
                         self.apply_gain_for(index);
                     }
                     self.set_error(String::new());
+                    true
                 }
-                Err(e) => self.set_error(e.to_string()),
+                Err(e) => {
+                    self.set_error(e.to_string());
+                    false
+                }
+            }
+        };
+
+        if started {
+            if let Some(index) = cue_index {
+                ivars.playing_cue.set(Some(index));
+
+                if ivars.cues.borrow()[index].auto_continue == cue::AutoContinue::Continue {
+                    self.start_next_cue(index);
+                }
             }
         }
     }
@@ -986,6 +1014,16 @@ impl AppHandler {
                     ));
                 }
             }
+        }
+
+        while let Some(key) = self
+            .ivars()
+            .audio
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.take_finished())
+        {
+            self.cue_finished(key);
         }
     }
 
@@ -1424,6 +1462,53 @@ impl AppHandler {
         self.load_cue_levels(row);
 
         self.set_error(String::new());
+    }
+
+    fn start_next_cue(&self, index: usize) {
+        let ivars = self.ivars();
+        let next = index + 1;
+
+        let Some(cue) = ivars.cues.borrow().get(next).cloned() else {
+            return;
+        };
+
+        if !helpers::is_audio_path(&cue.path) {
+            self.set_error(format!("Cue {} has no valid audio file", next + 1));
+            return;
+        }
+
+        ivars.active_cue.set(next);
+
+        let selected = NSIndexSet::indexSetWithIndex(next);
+        ivars
+            .cue_table
+            .selectRowIndexes_byExtendingSelection(&selected, false);
+        ivars.cue_table.scrollRowToVisible(next as NSInteger);
+
+        self.load_selected_cue();
+
+        let key = cue_key(&cue);
+        ivars.playing_cue.set(Some(next));
+        self.start_playback(&cue.path, 0, &cue.effects, key);
+    }
+
+    fn cue_finished(&self, key: usize) {
+        let ivars = self.ivars();
+
+        let index = {
+            let cues = ivars.cues.borrow();
+            cues.iter().position(|cue| cue_key(cue) == key)
+        };
+
+        let Some(index) = index else {
+            return;
+        };
+
+        if ivars.playing_cue.get() == Some(index) {
+            ivars.playing_cue.set(None);
+        }
+
+        self.start_next_cue(index);
     }
 }
 

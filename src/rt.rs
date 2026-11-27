@@ -5,6 +5,7 @@ pub const MAX_FRAMES: usize = 4096;
 pub static CALLS: AtomicUsize = AtomicUsize::new(0);
 const FX_WORDS: usize = 8;
 const MAX_TRACKS: usize = 32;
+const FINISHED_SLOTS: usize = 64;
 
 #[repr(C)]
 struct Asbd {
@@ -182,6 +183,7 @@ pub struct Shared {
     fade: AtomicU32,
     cur_in: UnsafeCell<[*mut f32; 2]>,
     scratch: UnsafeCell<[Vec<f32>; 6]>,
+    finished: [AtomicUsize; FINISHED_SLOTS],
 }
 
 unsafe impl Send for Shared {}
@@ -203,6 +205,7 @@ impl Shared {
             fade: AtomicU32::new(1f32.to_bits()),
             cur_in: UnsafeCell::new([null_mut(); 2]),
             scratch: UnsafeCell::new(std::array::from_fn(|_| vec![0f32; MAX_FRAMES])),
+            finished: std::array::from_fn(|_| AtomicUsize::new(usize::MAX)),
         }
     }
 
@@ -405,19 +408,35 @@ extern "C" fn render(
                 if t.cancel.load(Ordering::Relaxed) {
                     return false;
                 }
+
                 let total = t.total.load(Ordering::Acquire);
                 let filled = t.filled.load(Ordering::Acquire).min(total);
                 let pos = f64::from_bits(t.position.load(Ordering::Relaxed));
-                !(pos >= total as f64 && filled >= total)
-            });
 
-            s.playing.store(!g.tracks.is_empty(), Ordering::Relaxed);
-            if let Some(t) = g.tracks.first() {
-                s.pos.store(
-                    f64::from_bits(t.position.load(Ordering::Relaxed)) as usize,
-                    Ordering::Relaxed,
-                );
-            }
+                if pos >= total as f64 && filled >= total {
+                    let key = t.key.load(Ordering::Relaxed);
+
+                    if key != usize::MAX {
+                        for slot in &s.finished {
+                            if slot
+                                .compare_exchange(
+                                    usize::MAX,
+                                    key,
+                                    Ordering::Release,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    false
+                } else {
+                    true
+                }
+            });
         }
 
         let gn = f32::from_bits(s.gain.load(Ordering::Relaxed))
@@ -516,6 +535,13 @@ impl AudioState {
                 last: RefCell::new(None),
             })
         }
+    }
+
+    pub fn take_finished(&self) -> Option<usize> {
+        self.sh.finished.iter().find_map(|slot| {
+            let key = slot.swap(usize::MAX, Ordering::AcqRel);
+            (key != usize::MAX).then_some(key)
+        })
     }
 
     pub fn add_unit(&self, i: usize, u: *mut c_void, on: bool) {
