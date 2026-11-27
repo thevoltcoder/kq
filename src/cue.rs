@@ -6,6 +6,7 @@ pub struct Cue {
     pub name: String,
     pub path: PathBuf,
     pub duration: f64,
+    pub effects: Vec<bool>,
 }
 
 pub struct CueIvars {
@@ -148,6 +149,7 @@ impl CueController {
             name,
             path,
             duration,
+            effects: Vec::new(),
         });
         ivars.table.reloadData();
         ivars.cue_id.setStringValue(&NSString::new());
@@ -201,7 +203,7 @@ pub fn make_cue_list(
     table.setColumnAutoresizingStyle(
         NSTableViewColumnAutoresizingStyle::UniformColumnAutoresizingStyle,
     );
-    table.setAllowsEmptySelection(true);
+    table.setAllowsEmptySelection(false);
     table.setAllowsMultipleSelection(false);
 
     let scroll = NSScrollView::new(mtm);

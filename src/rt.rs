@@ -1,18 +1,10 @@
-use std::{
-    cell::{Cell, UnsafeCell},
-    ffi::c_void,
-    ptr::{copy_nonoverlapping, null_mut},
-    sync::{
-        Arc, Mutex,
-        atomic::{
-            AtomicBool, AtomicU32, AtomicU64, AtomicUsize,
-            Ordering::{Acquire, Relaxed, Release},
-        },
-    },
-};
+use super::*;
+use std::sync::atomic::Ordering;
 
 pub const MAX_FRAMES: usize = 4096;
 pub static CALLS: AtomicUsize = AtomicUsize::new(0);
+const FX_WORDS: usize = 8;
+const MAX_TRACKS: usize = 32;
 
 #[repr(C)]
 struct Asbd {
@@ -119,6 +111,8 @@ pub struct Track {
     pub cancel: AtomicBool,
     pub rate: f64,
     position: AtomicU64,
+    pub key: AtomicUsize,
+    fx: [AtomicU64; FX_WORDS],
     _own: (Vec<f32>, Vec<f32>),
 }
 
@@ -138,6 +132,8 @@ impl Track {
             cancel: AtomicBool::new(false),
             rate,
             position: AtomicU64::new(0.0f64.to_bits()),
+            key: AtomicUsize::new(usize::MAX),
+            fx: std::array::from_fn(|_| AtomicU64::new(0)),
             _own: (l, r),
         })
     }
@@ -148,7 +144,23 @@ impl Track {
             copy_nonoverlapping(r, self.r.add(at), n);
         }
 
-        self.filled.store(at + n, Release);
+        self.filled.store(at + n, Ordering::Release);
+    }
+
+    pub fn set_fx(&self, i: usize, on: bool) {
+        if i >= FX_WORDS * 64 {
+            return;
+        }
+        let bit = 1u64 << (i % 64);
+        if on {
+            self.fx[i / 64].fetch_or(bit, Ordering::Relaxed);
+        } else {
+            self.fx[i / 64].fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
+
+    fn fx_mask(&self) -> [u64; FX_WORDS] {
+        std::array::from_fn(|i| self.fx[i].load(Ordering::Relaxed))
     }
 }
 
@@ -165,9 +177,11 @@ pub struct Shared {
     pub pos: AtomicUsize,
     pub playing: AtomicBool,
     pub gain: AtomicU32,
+    pub gain_l: AtomicU32,
+    pub gain_r: AtomicU32,
     fade: AtomicU32,
     cur_in: UnsafeCell<[*mut f32; 2]>,
-    scratch: UnsafeCell<[Vec<f32>; 4]>,
+    scratch: UnsafeCell<[Vec<f32>; 6]>,
 }
 
 unsafe impl Send for Shared {}
@@ -184,6 +198,8 @@ impl Shared {
             pos: AtomicUsize::new(0),
             playing: AtomicBool::new(false),
             gain: AtomicU32::new(1f32.to_bits()),
+            gain_l: AtomicU32::new(1f32.to_bits()),
+            gain_r: AtomicU32::new(1f32.to_bits()),
             fade: AtomicU32::new(1f32.to_bits()),
             cur_in: UnsafeCell::new([null_mut(); 2]),
             scratch: UnsafeCell::new(std::array::from_fn(|_| vec![0f32; MAX_FRAMES])),
@@ -191,7 +207,7 @@ impl Shared {
     }
 
     pub fn set_fade(&self, v: f32) {
-        self.fade.store(v.to_bits(), Relaxed);
+        self.fade.store(v.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -225,6 +241,36 @@ extern "C" fn fx_input(
     0
 }
 
+fn mask_has(mask: &[u64; FX_WORDS], i: usize) -> bool {
+    i < FX_WORDS * 64 && (mask[i / 64] >> (i % 64)) & 1 == 1
+}
+
+unsafe fn mix_track(t: &Track, out: [*mut f32; 2], n: usize) {
+    unsafe {
+        let total = t.total.load(Ordering::Acquire);
+        let filled = t.filled.load(Ordering::Acquire).min(total);
+        let mut pos = f64::from_bits(t.position.load(Ordering::Relaxed));
+        let step = t.rate / 44100.0;
+
+        for frame in 0..n {
+            let index = pos as usize;
+            if index >= filled {
+                break;
+            }
+            let next = (index + 1).min(filled.saturating_sub(1));
+            let frac = (pos - index as f64) as f32;
+
+            let (l, r) = (*t.l.add(index), *t.r.add(index));
+            let (ln, rn) = (*t.l.add(next), *t.r.add(next));
+
+            *out[0].add(frame) += l + (ln - l) * frac;
+            *out[1].add(frame) += r + (rn - r) * frac;
+            pos += step;
+        }
+        t.position.store(pos.to_bits(), Ordering::Relaxed);
+    }
+}
+
 extern "C" fn render(
     rc: *mut c_void,
     _f: *mut u32,
@@ -233,100 +279,66 @@ extern "C" fn render(
     frames: u32,
     io: *mut Abl,
 ) -> i32 {
-    CALLS.fetch_add(1, Relaxed);
+    CALLS.fetch_add(1, Ordering::Relaxed);
 
     unsafe {
         let s = &*(rc as *const Shared);
         let n = frames as usize;
-
         if n > MAX_FRAMES {
             return 0;
         }
 
         let sc = &mut *s.scratch.get();
+        let mix = [sc[0].as_mut_ptr(), sc[1].as_mut_ptr()];
+        let cur0 = [sc[2].as_mut_ptr(), sc[3].as_mut_ptr()];
+        let oth0 = [sc[4].as_mut_ptr(), sc[5].as_mut_ptr()];
 
-        let mut cur = [sc[0].as_mut_ptr(), sc[1].as_mut_ptr()];
-        let mut oth = [sc[2].as_mut_ptr(), sc[3].as_mut_ptr()];
-
-        std::ptr::write_bytes(cur[0], 0, n);
-        std::ptr::write_bytes(cur[1], 0, n);
-
-        let mut has_tracks = false;
+        std::ptr::write_bytes(mix[0], 0, n);
+        std::ptr::write_bytes(mix[1], 0, n);
 
         if let Ok(mut g) = s.inner.try_lock() {
-            let mut i = 0;
+            let count = g.tracks.len().min(MAX_TRACKS);
+            let mut done = [false; MAX_TRACKS];
 
-            while i < g.tracks.len() {
-                let t = &g.tracks[i];
-
-                if t.cancel.load(Relaxed) {
-                    g.tracks.remove(i);
+            for i in 0..count {
+                if done[i] {
+                    continue;
+                }
+                if g.tracks[i].cancel.load(Ordering::Relaxed) {
+                    done[i] = true;
                     continue;
                 }
 
-                let total = t.total.load(Acquire);
-                let filled = t.filled.load(Acquire).min(total);
+                let mask = g.tracks[i].fx_mask();
+                std::ptr::write_bytes(cur0[0], 0, n);
+                std::ptr::write_bytes(cur0[1], 0, n);
 
-                let mut pos = f64::from_bits(t.position.load(Relaxed));
-                let step = t.rate / 44100.0;
-
-                let mut produced = false;
-
-                for frame in 0..n {
-                    let index = pos as usize;
-
-                    if index >= filled {
-                        break;
+                for j in i..count {
+                    if done[j] {
+                        continue;
                     }
-
-                    let next = (index + 1).min(filled.saturating_sub(1));
-                    let frac = (pos - index as f64) as f32;
-
-                    let left = *t.l.add(index);
-                    let right = *t.r.add(index);
-
-                    let left_next = *t.l.add(next);
-                    let right_next = *t.r.add(next);
-
-                    *cur[0].add(frame) += left + (left_next - left) * frac;
-                    *cur[1].add(frame) += right + (right_next - right) * frac;
-
-                    pos += step;
-                    produced = true;
+                    let t = &g.tracks[j];
+                    if t.cancel.load(Ordering::Relaxed) {
+                        done[j] = true;
+                        continue;
+                    }
+                    if t.fx_mask() != mask {
+                        continue;
+                    }
+                    mix_track(t, cur0, n);
+                    done[j] = true;
                 }
 
-                t.position.store(pos.to_bits(), Relaxed);
+                let mut cur = cur0;
+                let mut oth = oth0;
 
-                if produced {
-                    has_tracks = true;
-                }
-
-                let finished = pos >= total as f64 && filled >= total;
-
-                if finished {
-                    g.tracks.remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-
-            s.playing.store(!g.tracks.is_empty(), Relaxed);
-
-            if let Some(t) = g.tracks.first() {
-                s.pos
-                    .store(f64::from_bits(t.position.load(Relaxed)) as usize, Relaxed);
-            }
-
-            if has_tracks {
-                for (i, &u) in g.units.iter().enumerate() {
-                    if u.is_null() || !s.enabled[i].load(Relaxed) {
+                for (ui, &u) in g.units.iter().enumerate() {
+                    if u.is_null() || !mask_has(&mask, ui) {
                         continue;
                     }
 
                     *s.cur_in.get() = cur;
-
                     let sz = (n * 4) as u32;
-
                     let mut abl = Abl {
                         n: 2,
                         b: [
@@ -342,7 +354,6 @@ extern "C" fn render(
                             },
                         ],
                     };
-
                     let mut fl = 0u32;
 
                     if AudioUnitRender(u, &mut fl, ts, 0, frames, &mut abl) == 0 {
@@ -351,22 +362,46 @@ extern "C" fn render(
                                 copy_nonoverlapping(abl.b[c].data, oth[c], n);
                             }
                         }
-
                         std::mem::swap(&mut cur, &mut oth);
                     }
                 }
+
+                for c in 0..2 {
+                    for k in 0..n {
+                        *mix[c].add(k) += *cur[c].add(k);
+                    }
+                }
+            }
+
+            g.tracks.retain(|t| {
+                if t.cancel.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let total = t.total.load(Ordering::Acquire);
+                let filled = t.filled.load(Ordering::Acquire).min(total);
+                let pos = f64::from_bits(t.position.load(Ordering::Relaxed));
+                !(pos >= total as f64 && filled >= total)
+            });
+
+            s.playing.store(!g.tracks.is_empty(), Ordering::Relaxed);
+            if let Some(t) = g.tracks.first() {
+                s.pos.store(
+                    f64::from_bits(t.position.load(Ordering::Relaxed)) as usize,
+                    Ordering::Relaxed,
+                );
             }
         }
 
-        let gn = f32::from_bits(s.gain.load(Relaxed)) * f32::from_bits(s.fade.load(Relaxed));
-
-        for c in 0..2 {
-            for i in 0..n {
-                *cur[c].add(i) *= gn;
-            }
+        let gn = f32::from_bits(s.gain.load(Ordering::Relaxed))
+            * f32::from_bits(s.fade.load(Ordering::Relaxed));
+        let gl = gn * f32::from_bits(s.gain_l.load(Ordering::Relaxed));
+        let gr = gn * f32::from_bits(s.gain_r.load(Ordering::Relaxed));
+        for i in 0..n {
+            *mix[0].add(i) *= gl;
+            *mix[1].add(i) *= gr;
         }
 
-        deliver(&mut *io, cur, n);
+        deliver(&mut *io, mix, n);
     }
 
     0
@@ -397,6 +432,9 @@ pub struct AudioState {
     pub sh: Arc<Shared>,
     _out: *mut c_void,
     rate: Cell<f64>,
+    next_fx: RefCell<Vec<bool>>,
+    next_key: Cell<usize>,
+    last: RefCell<Option<Arc<Track>>>,
 }
 
 impl AudioState {
@@ -445,6 +483,9 @@ impl AudioState {
                 sh,
                 _out: u,
                 rate: Cell::new(44100.0),
+                next_fx: RefCell::new(Vec::new()),
+                next_key: Cell::new(usize::MAX),
+                last: RefCell::new(None),
             })
         }
     }
@@ -458,38 +499,67 @@ impl AudioState {
             return;
         }
 
-        self.sh.enabled[i].store(on, Relaxed);
+        self.sh.enabled[i].store(on, Ordering::Relaxed);
         self.sh.inner.lock().unwrap().units[i] = u;
     }
 
+    pub fn set_next_fx(&self, fx: &[bool]) {
+        *self.next_fx.borrow_mut() = fx.to_vec();
+    }
+
+    pub fn set_next_key(&self, key: usize) {
+        self.next_key.set(key);
+    }
+
+    pub fn is_playing_key(&self, key: usize) -> bool {
+        self.sh
+            .inner
+            .lock()
+            .unwrap()
+            .tracks
+            .iter()
+            .any(|t| t.key.load(Ordering::Relaxed) == key && !t.cancel.load(Ordering::Relaxed))
+    }
+
+    pub fn set_last_fx(&self, i: usize, on: bool) {
+        if let Some(t) = self.last.borrow().as_ref() {
+            t.set_fx(i, on);
+        }
+    }
+
     pub fn play(&self, track: Arc<Track>, frame: usize) {
-        let frame = if frame >= track.total.load(Relaxed) {
+        let frame = if frame >= track.total.load(Ordering::Relaxed) {
             0
         } else {
             frame
         };
+        track
+            .position
+            .store((frame as f64).to_bits(), Ordering::Relaxed);
 
-        track.position.store((frame as f64).to_bits(), Relaxed);
+        for (i, &on) in self.next_fx.borrow().iter().enumerate() {
+            track.set_fx(i, on);
+        }
+        track.key.store(self.next_key.get(), Ordering::Relaxed);
+        *self.last.borrow_mut() = Some(track.clone());
 
         let mut g = self.sh.inner.lock().unwrap();
-
         g.tracks.push(track);
-
         self.sh.set_fade(1.0);
-        self.sh.playing.store(true, Release);
+        self.sh.playing.store(true, Ordering::Release);
     }
 
     pub fn stop(&self) {
         let mut g = self.sh.inner.lock().unwrap();
 
         for track in &g.tracks {
-            track.cancel.store(true, Relaxed);
+            track.cancel.store(true, Ordering::Relaxed);
         }
 
         g.tracks.clear();
 
-        self.sh.playing.store(false, Relaxed);
-        self.sh.pos.store(0, Relaxed);
+        self.sh.playing.store(false, Ordering::Relaxed);
+        self.sh.pos.store(0, Ordering::Relaxed);
         self.sh.set_fade(1.0);
     }
 }

@@ -29,6 +29,14 @@ pub struct Editor {
 
 pub use super::rt::AudioState;
 
+fn cue_key(cue: &cue::Cue) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cue.id.hash(&mut hasher);
+    cue.path.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
 pub struct AppIvars {
     pub field: Retained<NSTextField>,
     pub error_label: Retained<NSTextField>,
@@ -47,7 +55,7 @@ pub struct AppIvars {
     pub loading: RefCell<Vec<bool>>,
     pub effect_tx: std::sync::mpsc::Sender<(usize, Result<usize, String>)>,
     pub effect_rx: RefCell<std::sync::mpsc::Receiver<(usize, Result<usize, String>)>>,
-    pub pending_playback: RefCell<VecDeque<(PathBuf, i64)>>,
+    pub pending_playback: RefCell<VecDeque<(PathBuf, i64, usize)>>,
     pub pending_editor: Cell<Option<usize>>,
     pub poll_timer: RefCell<Option<Retained<NSTimer>>>,
     pub rebuild_at: Cell<Option<std::time::Instant>>,
@@ -58,6 +66,8 @@ pub struct AppIvars {
     pub cues: RefCell<Vec<cue::Cue>>,
     pub active_cue: Cell<usize>,
     pub initial_cue_selection: Cell<bool>,
+    pub chain: RefCell<Vec<bool>>,
+    pub playing_cue: Cell<Option<usize>>,
 }
 
 define_class!(
@@ -210,7 +220,22 @@ define_class!(
                 return;
             }
 
-            self.start_playback(&cue.path, 0);
+            let key = cue_key(&cue);
+            let queued = ivars
+                .pending_playback
+                .borrow()
+                .iter()
+                .any(|(_, _, k)| *k == key);
+            let live = ivars
+                .audio
+                .borrow()
+                .as_ref()
+                .map_or(false, |s| s.is_playing_key(key));
+
+            if !queued && !live {
+                ivars.playing_cue.set(Some(index));
+                self.start_playback(&cue.path, 0, &cue.effects, key);
+            }
 
             let next = (index + 1).min(ivars.cues.borrow().len() - 1);
             ivars.active_cue.set(next);
@@ -298,6 +323,12 @@ define_class!(
 
         #[unsafe(method(onCueSelect:))]
         fn on_cue_select(&self, _sender: Option<&AnyObject>) {
+            let ivars = self.ivars();
+            let row = ivars.cue_table.selectedRow();
+            if row < 0 {
+                return;
+            }
+            ivars.active_cue.set(row as usize);
             self.load_selected_cue();
         }
     }
@@ -315,10 +346,11 @@ impl AppHandler {
         cue_table: Retained<NSTableView>,
     ) -> Retained<Self> {
         let installed = helpers::list_installed_effects();
-        let filtered = (0..installed.len()).collect();
-        let enabled = vec![false; installed.len()];
-        let nodes = (0..installed.len()).map(|_| None).collect();
-        let loading = vec![false; installed.len()];
+        let n = installed.len();
+        let filtered = (0..n).collect();
+        let enabled = vec![false; n];
+        let nodes = (0..n).map(|_| None).collect();
+        let loading = vec![false; n];
 
         let (effect_tx, effect_rx) = std::sync::mpsc::channel();
 
@@ -353,9 +385,12 @@ impl AppHandler {
                 name: String::new(),
                 path: PathBuf::new(),
                 duration: 0.0,
+                effects: vec![false; n],
             }]),
             active_cue: Cell::new(0),
             initial_cue_selection: Cell::new(false),
+            chain: RefCell::new(vec![false; n]),
+            playing_cue: Cell::new(None),
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -436,17 +471,31 @@ impl AppHandler {
         self.apply_gain();
     }
 
-    pub fn set_gain_l(&self, _db: f64) {}
+    pub fn set_gain_l(&self, db: f64) {
+        self.ivars().gain_l.set(Self::db_to_lin(db));
+        self.apply_gain();
+    }
 
-    pub fn set_gain_r(&self, _db: f64) {}
+    pub fn set_gain_r(&self, db: f64) {
+        self.ivars().gain_r.set(Self::db_to_lin(db));
+        self.apply_gain();
+    }
 
     fn apply_gain(&self) {
-        let gain = self.ivars().gain.get();
-        if let Some(state) = self.ivars().audio.borrow().as_ref() {
-            state
-                .sh
-                .gain
-                .store(gain.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        let ivars = self.ivars();
+        if let Some(state) = ivars.audio.borrow().as_ref() {
+            state.sh.gain.store(
+                ivars.gain.get().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            state.sh.gain_l.store(
+                ivars.gain_l.get().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            state.sh.gain_r.store(
+                ivars.gain_r.get().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -458,6 +507,7 @@ impl AppHandler {
         if let Some(state) = self.ivars().audio.borrow().as_ref() {
             state.stop();
         }
+        self.ivars().playing_cue.set(None);
     }
 
     pub fn begin_fade_stop(&self) {
@@ -471,7 +521,7 @@ impl AppHandler {
 
     fn try_start_pending_playback(&self) {
         let ivars = self.ivars();
-        let Some((path, frame)) = ivars.pending_playback.borrow_mut().pop_front() else {
+        let Some((path, frame, key)) = ivars.pending_playback.borrow_mut().pop_front() else {
             return;
         };
         if ivars.audio.borrow().is_none() {
@@ -488,18 +538,20 @@ impl AppHandler {
                 }
             }
         }
-        let enabled = ivars.enabled.borrow().clone();
+        let enabled = ivars.chain.borrow().clone();
         for (index, on) in enabled.iter().enumerate() {
             if *on && ivars.nodes.borrow()[index].is_none() {
                 self.request_node(index);
                 ivars
                     .pending_playback
                     .borrow_mut()
-                    .push_front((path, frame));
+                    .push_front((path, frame, key));
                 return;
             }
         }
         if let Some(state) = ivars.audio.borrow().as_ref() {
+            state.set_next_fx(&enabled);
+            state.set_next_key(key);
             match helpers::play_audio(state, &path, frame) {
                 Ok(()) => {
                     self.apply_gain();
@@ -558,7 +610,6 @@ impl AppHandler {
     }
 
     pub fn set_effect(&self, index: usize, on: bool) {
-        let t = Instant::now();
         let ivars = self.ivars();
         {
             let mut enabled = ivars.enabled.borrow_mut();
@@ -567,13 +618,21 @@ impl AppHandler {
             }
             enabled[index] = on;
         }
+        let active = ivars.active_cue.get();
+        if let Some(cue) = ivars.cues.borrow_mut().get_mut(active) {
+            if index < cue.effects.len() {
+                cue.effects[index] = on;
+            }
+        }
         if on {
             self.request_node(index);
         }
-        if let Some(state) = ivars.audio.borrow().as_ref() {
-            helpers::set_effect_enabled(state, index, on);
+        if ivars.playing_cue.get() == Some(active) {
+            ivars.chain.borrow_mut()[index] = on;
+            if let Some(state) = ivars.audio.borrow().as_ref() {
+                state.set_last_fx(index, on);
+            }
         }
-        println!("toggle took {:?}", t.elapsed());
     }
 
     pub fn edit_selected(&self) {
@@ -635,12 +694,14 @@ impl AppHandler {
         }
     }
 
-    fn start_playback(&self, path: &Path, frame: i64) {
-        println!("start_playback {path:?}");
+    fn start_playback(&self, path: &Path, frame: i64, effects: &[bool], key: usize) {
+        let mut chain = effects.to_vec();
+        chain.resize(self.ivars().installed.len(), false);
+        *self.ivars().chain.borrow_mut() = chain;
         self.ivars()
             .pending_playback
             .borrow_mut()
-            .push_back((path.to_path_buf(), frame));
+            .push_back((path.to_path_buf(), frame, key));
         self.try_start_pending_playback();
     }
 
@@ -721,7 +782,7 @@ impl AppHandler {
 
     fn loaded_slots(&self) -> Vec<Slot> {
         let ivars = self.ivars();
-        let enabled = ivars.enabled.borrow();
+        let enabled = ivars.chain.borrow();
         ivars
             .nodes
             .borrow()
@@ -755,6 +816,7 @@ impl AppHandler {
             name: String::new(),
             path: PathBuf::new(),
             duration: 0.0,
+            effects: vec![false; ivars.installed.len()],
         });
 
         let index = cues.len() - 1;
@@ -772,6 +834,8 @@ impl AppHandler {
         ivars.cue_name.setStringValue(&NSString::new());
         ivars.field.setStringValue(&NSString::new());
 
+        *ivars.enabled.borrow_mut() = vec![false; ivars.installed.len()];
+        ivars.available_table.reloadData();
         self.set_error(String::new());
     }
 
@@ -796,6 +860,14 @@ impl AppHandler {
         }
 
         cues.remove(row);
+
+        if let Some(p) = ivars.playing_cue.get() {
+            if p == row {
+                ivars.playing_cue.set(None);
+            } else if p > row {
+                ivars.playing_cue.set(Some(p - 1));
+            }
+        }
 
         let active = ivars.active_cue.get();
         let next_active = if row < active {
@@ -845,7 +917,6 @@ impl AppHandler {
         };
 
         let mut cues = ivars.cues.borrow_mut();
-
         if row >= cues.len() {
             return;
         }
@@ -858,14 +929,14 @@ impl AppHandler {
             self.set_error(format!("Cue ID {id} already exists"));
             return;
         }
-
+        let effects = cues[row].effects.clone();
         cues[row] = cue::Cue {
             id,
             name,
             path,
             duration,
+            effects,
         };
-
         drop(cues);
 
         ivars.cue_table.reloadData();
@@ -919,6 +990,18 @@ impl AppHandler {
             .field
             .setStringValue(&NSString::from_str(&cue.path.to_string_lossy()));
 
+        let mut fx = cue.effects.clone();
+        fx.resize(ivars.installed.len(), false);
+        *ivars.enabled.borrow_mut() = fx;
+
+        let sel = ivars.available_table.selectedRow();
+        ivars.available_table.reloadData();
+        if sel >= 0 {
+            ivars.available_table.selectRowIndexes_byExtendingSelection(
+                &NSIndexSet::indexSetWithIndex(sel as usize),
+                false,
+            );
+        }
         self.set_error(String::new());
     }
 }
