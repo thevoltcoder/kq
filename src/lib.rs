@@ -17,7 +17,6 @@ pub use std::{
 };
 
 const FADE_SECS: f32 = 1.0;
-const FADE_MIN_DB: f32 = -60.0;
 const FADE_TICK_SECS: f64 = 1.0 / 60.0;
 const AUDIO_EXTS: &[&str] = &["wav", "mp3", "m4a", "aac", "aif", "aiff", "caf", "flac"];
 const COCOA_UI_PROPERTY: u32 = 31;

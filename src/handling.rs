@@ -37,6 +37,15 @@ fn cue_key(cue: &cue::Cue) -> usize {
     hasher.finish() as usize
 }
 
+pub struct GainControls {
+    pub gain_slider: Retained<NSSlider>,
+    pub gain_field: Retained<NSTextField>,
+    pub gain_l_slider: Retained<NSSlider>,
+    pub gain_l_field: Retained<NSTextField>,
+    pub gain_r_slider: Retained<NSSlider>,
+    pub gain_r_field: Retained<NSTextField>,
+}
+
 pub struct AppIvars {
     pub field: Retained<NSTextField>,
     pub error_label: Retained<NSTextField>,
@@ -49,9 +58,6 @@ pub struct AppIvars {
     pub editors: RefCell<Vec<Editor>>,
     pub audio: RefCell<Option<AudioState>>,
     pub fade: RefCell<Option<Retained<NSTimer>>>,
-    pub gain: Cell<f32>,
-    pub gain_l: Cell<f32>,
-    pub gain_r: Cell<f32>,
     pub loading: RefCell<Vec<bool>>,
     pub effect_tx: std::sync::mpsc::Sender<(usize, Result<usize, String>)>,
     pub effect_rx: RefCell<std::sync::mpsc::Receiver<(usize, Result<usize, String>)>>,
@@ -68,6 +74,11 @@ pub struct AppIvars {
     pub initial_cue_selection: Cell<bool>,
     pub chain: RefCell<Vec<bool>>,
     pub playing_cue: Cell<Option<usize>>,
+    pub cue_duration: Retained<NSTextField>,
+    pub fade_target: Retained<NSTextField>,
+    pub stop_after_fade: Retained<NSPopUpButton>,
+    pub auto_continue: Retained<NSPopUpButton>,
+    pub gain_controls: RefCell<Option<GainControls>>,
 }
 
 define_class!(
@@ -208,6 +219,8 @@ define_class!(
 
         #[unsafe(method(onPlay:))]
         fn on_play(&self, _sender: Option<&AnyObject>) {
+            self.update_selected_cue();
+
             let ivars = self.ivars();
             let index = ivars.active_cue.get();
 
@@ -215,29 +228,65 @@ define_class!(
                 return;
             };
 
-            if !helpers::is_audio_path(&cue.path) {
-                self.set_error(format!("Cue {} has no valid audio file", index + 1));
-                return;
+            if let Some(target) = &cue.fade_target {
+                if ivars.fade.borrow().is_some() {
+                    self.set_error("A fade is already in progress".to_string());
+                    return;
+                }
+
+                let target_index = {
+                    let cues = ivars.cues.borrow();
+                    cues.iter().position(|c| c.id == *target)
+                };
+
+                let Some(target_index) = target_index else {
+                    self.set_error(format!("Fade target {target} does not exist"));
+                    return;
+                };
+
+                if ivars.playing_cue.get() != Some(target_index)
+                    || ivars.audio.borrow().is_none()
+                {
+                    self.set_error(format!("Fade target {target} is not currently playing"));
+                    return;
+                }
+
+                self.begin_fade_stop(
+                    cue.duration,
+                    cue.stop_after_fade,
+                    cue.gain,
+                    cue.gain_l,
+                    cue.gain_r,
+                );
+            } else {
+                if !helpers::is_audio_path(&cue.path) {
+                    self.set_error(format!("Cue {} has no valid audio file", index + 1));
+                    return;
+                }
+
+                let key = cue_key(&cue);
+
+                let queued = ivars
+                    .pending_playback
+                    .borrow()
+                    .iter()
+                    .any(|(_, _, k)| *k == key);
+
+                let live = ivars
+                    .audio
+                    .borrow()
+                    .as_ref()
+                    .map_or(false, |s| s.is_playing_key(key));
+
+                if !queued && !live {
+                    ivars.playing_cue.set(Some(index));
+                    self.start_playback(&cue.path, 0, &cue.effects, key);
+                }
             }
 
-            let key = cue_key(&cue);
-            let queued = ivars
-                .pending_playback
-                .borrow()
-                .iter()
-                .any(|(_, _, k)| *k == key);
-            let live = ivars
-                .audio
-                .borrow()
-                .as_ref()
-                .map_or(false, |s| s.is_playing_key(key));
+            let len = ivars.cues.borrow().len();
+            let next = (index + 1).min(len.saturating_sub(1));
 
-            if !queued && !live {
-                ivars.playing_cue.set(Some(index));
-                self.start_playback(&cue.path, 0, &cue.effects, key);
-            }
-
-            let next = (index + 1).min(ivars.cues.borrow().len() - 1);
             ivars.active_cue.set(next);
 
             let selected = NSIndexSet::indexSetWithIndex(next);
@@ -247,7 +296,7 @@ define_class!(
 
         #[unsafe(method(onStop:))]
         fn on_stop(&self, _sender: Option<&AnyObject>) {
-            self.begin_fade_stop();
+            self.begin_fade_stop(FADE_SECS as f64, true, 0.0, 0.0, 0.0);
         }
 
         #[unsafe(method(onSearch:))]
@@ -328,8 +377,21 @@ define_class!(
             if row < 0 {
                 return;
             }
+
+            self.update_selected_cue();
+
             ivars.active_cue.set(row as usize);
             self.load_selected_cue();
+        }
+
+        #[unsafe(method(onAddFadeCue:))]
+        fn on_add_fade_cue(&self, _sender: Option<&AnyObject>) {
+            self.add_fade_cue();
+        }
+
+        #[unsafe(method(onCueOptionsChanged:))]
+        fn on_cue_options_changed(&self, _sender: Option<&AnyObject>) {
+            self.update_selected_cue();
         }
     }
 );
@@ -343,6 +405,10 @@ impl AppHandler {
         available_table: Retained<NSTableView>,
         cue_id: Retained<NSTextField>,
         cue_name: Retained<NSTextField>,
+        cue_duration: Retained<NSTextField>,
+        fade_target: Retained<NSTextField>,
+        stop_after_fade: Retained<NSPopUpButton>,
+        auto_continue: Retained<NSPopUpButton>,
         cue_table: Retained<NSTableView>,
     ) -> Retained<Self> {
         let installed = helpers::list_installed_effects();
@@ -372,9 +438,7 @@ impl AppHandler {
             editors: RefCell::new(Vec::new()),
             audio: RefCell::new(None),
             fade: RefCell::new(None),
-            gain: Cell::new(1.0),
-            gain_l: Cell::new(1.0),
-            gain_r: Cell::new(1.0),
+            gain_controls: RefCell::new(None),
             rebuild_at: Cell::new(None),
             termination_confirmed: Cell::new(false),
             cue_id,
@@ -386,11 +450,21 @@ impl AppHandler {
                 path: PathBuf::new(),
                 duration: 0.0,
                 effects: vec![false; n],
+                fade_target: None,
+                stop_after_fade: true,
+                auto_continue: cue::AutoContinue::None,
+                gain: 1.0,
+                gain_l: 1.0,
+                gain_r: 1.0,
             }]),
             active_cue: Cell::new(0),
             initial_cue_selection: Cell::new(false),
             chain: RefCell::new(vec![false; n]),
             playing_cue: Cell::new(None),
+            cue_duration,
+            fade_target,
+            stop_after_fade,
+            auto_continue,
         });
 
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -411,6 +485,27 @@ impl AppHandler {
         }
 
         this
+    }
+
+    pub fn set_gain_controls(
+        &self,
+        gain_slider: Retained<NSSlider>,
+        gain_field: Retained<NSTextField>,
+        gain_l_slider: Retained<NSSlider>,
+        gain_l_field: Retained<NSTextField>,
+        gain_r_slider: Retained<NSSlider>,
+        gain_r_field: Retained<NSTextField>,
+    ) {
+        *self.ivars().gain_controls.borrow_mut() = Some(GainControls {
+            gain_slider,
+            gain_field,
+            gain_l_slider,
+            gain_l_field,
+            gain_r_slider,
+            gain_r_field,
+        });
+
+        self.load_cue_levels(self.ivars().active_cue.get());
     }
 
     fn ensure_initial_cue_selection(&self) {
@@ -466,57 +561,181 @@ impl AppHandler {
         }
     }
 
+    fn lin_to_db(gain: f32) -> f64 {
+        if gain <= 0.0001 {
+            -80.0
+        } else {
+            (20.0 * gain.log10()).clamp(-80.0, 24.0) as f64
+        }
+    }
+
     pub fn set_gain(&self, db: f64) {
-        self.ivars().gain.set(Self::db_to_lin(db));
-        self.apply_gain();
+        self.set_cue_gain(db, 0);
     }
 
     pub fn set_gain_l(&self, db: f64) {
-        self.ivars().gain_l.set(Self::db_to_lin(db));
-        self.apply_gain();
+        self.set_cue_gain(db, 1);
     }
 
     pub fn set_gain_r(&self, db: f64) {
-        self.ivars().gain_r.set(Self::db_to_lin(db));
-        self.apply_gain();
+        self.set_cue_gain(db, 2);
     }
 
-    fn apply_gain(&self) {
+    fn set_cue_gain(&self, db: f64, channel: usize) {
         let ivars = self.ivars();
+        let index = ivars.active_cue.get();
+
+        {
+            let mut cues = ivars.cues.borrow_mut();
+            let Some(cue) = cues.get_mut(index) else {
+                return;
+            };
+
+            match channel {
+                0 => cue.gain = Self::db_to_lin(db),
+                1 => cue.gain_l = Self::db_to_lin(db),
+                _ => cue.gain_r = Self::db_to_lin(db),
+            }
+        }
+
+        if ivars.playing_cue.get() == Some(index) {
+            self.apply_gain_for(index);
+        }
+    }
+
+    fn apply_gain_for(&self, index: usize) {
+        let ivars = self.ivars();
+
+        let Some((gain, gain_l, gain_r)) = ivars
+            .cues
+            .borrow()
+            .get(index)
+            .map(|cue| (cue.gain, cue.gain_l, cue.gain_r))
+        else {
+            return;
+        };
+
         if let Some(state) = ivars.audio.borrow().as_ref() {
-            state.sh.gain.store(
-                ivars.gain.get().to_bits(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            state.sh.gain_l.store(
-                ivars.gain_l.get().to_bits(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            state.sh.gain_r.store(
-                ivars.gain_r.get().to_bits(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            state
+                .sh
+                .gain
+                .store(gain.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            state
+                .sh
+                .gain_l
+                .store(gain_l.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            state
+                .sh
+                .gain_r
+                .store(gain_r.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn load_cue_levels(&self, index: usize) {
+        let ivars = self.ivars();
+
+        let Some((gain, gain_l, gain_r)) = ivars
+            .cues
+            .borrow()
+            .get(index)
+            .map(|cue| (cue.gain, cue.gain_l, cue.gain_r))
+        else {
+            return;
+        };
+
+        let controls = ivars.gain_controls.borrow();
+        let Some(controls) = controls.as_ref() else {
+            return;
+        };
+
+        for (value, slider, field) in [
+            (gain, &controls.gain_slider, &controls.gain_field),
+            (gain_l, &controls.gain_l_slider, &controls.gain_l_field),
+            (gain_r, &controls.gain_r_slider, &controls.gain_r_field),
+        ] {
+            let db = Self::lin_to_db(value);
+            slider.setDoubleValue(db);
+            field.setStringValue(&NSString::from_str(&format!("{db:.1} dB")));
         }
     }
 
     pub fn finish_stop(&self) {
         self.ivars().pending_playback.borrow_mut().clear();
+
         if let Some(timer) = self.ivars().fade.borrow_mut().take() {
             timer.invalidate();
         }
+
         if let Some(state) = self.ivars().audio.borrow().as_ref() {
             state.stop();
         }
+
         self.ivars().playing_cue.set(None);
     }
 
-    pub fn begin_fade_stop(&self) {
-        let Some(sh) = self.ivars().audio.borrow().as_ref().map(|s| s.sh.clone()) else {
+    fn begin_fade_stop(
+        &self,
+        duration: f64,
+        stop_after: bool,
+        target_gain: f32,
+        target_gain_l: f32,
+        target_gain_r: f32,
+    ) {
+        let ivars = self.ivars();
+
+        let Some(sh) = ivars.audio.borrow().as_ref().map(|s| s.sh.clone()) else {
             return;
         };
+
+        if let Some(timer) = ivars.fade.borrow_mut().take() {
+            timer.invalidate();
+        }
+
+        let ordering = std::sync::atomic::Ordering::Relaxed;
+
+        let start_gain = f32::from_bits(sh.gain.load(ordering));
+        let start_gain_l = f32::from_bits(sh.gain_l.load(ordering));
+        let start_gain_r = f32::from_bits(sh.gain_r.load(ordering));
+
+        sh.set_fade(1.0);
+
+        let started = std::time::Instant::now();
+        let duration = duration.max(0.0);
         let this = self.retain();
-        let timer = helpers::fade_out(sh, move || this.finish_stop());
-        *self.ivars().fade.borrow_mut() = Some(timer);
+
+        let block = RcBlock::new(move |timer: NonNull<NSTimer>| {
+            let progress = if duration == 0.0 {
+                1.0
+            } else {
+                (started.elapsed().as_secs_f64() / duration).clamp(0.0, 1.0) as f32
+            };
+
+            sh.set_gain(start_gain + (target_gain - start_gain) * progress);
+            sh.set_gain_l(start_gain_l + (target_gain_l - start_gain_l) * progress);
+            sh.set_gain_r(start_gain_r + (target_gain_r - start_gain_r) * progress);
+
+            if progress >= 1.0 {
+                sh.set_gain(target_gain);
+                sh.set_gain_l(target_gain_l);
+                sh.set_gain_r(target_gain_r);
+
+                unsafe {
+                    timer.as_ref().invalidate();
+                }
+
+                if stop_after {
+                    this.finish_stop();
+                } else {
+                    this.ivars().fade.borrow_mut().take();
+                }
+            }
+        });
+
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_repeats_block(FADE_TICK_SECS, true, &block)
+        };
+
+        *ivars.fade.borrow_mut() = Some(timer);
     }
 
     fn try_start_pending_playback(&self) {
@@ -554,7 +773,9 @@ impl AppHandler {
             state.set_next_key(key);
             match helpers::play_audio(state, &path, frame) {
                 Ok(()) => {
-                    self.apply_gain();
+                    if let Some(index) = ivars.playing_cue.get() {
+                        self.apply_gain_for(index);
+                    }
                     self.set_error(String::new());
                 }
                 Err(e) => self.set_error(e.to_string()),
@@ -695,6 +916,12 @@ impl AppHandler {
     }
 
     fn start_playback(&self, path: &Path, frame: i64, effects: &[bool], key: usize) {
+        if let Some(timer) = self.ivars().fade.borrow_mut().take() {
+            timer.invalidate();
+        }
+        if let Some(state) = self.ivars().audio.borrow().as_ref() {
+            state.sh.set_fade(1.0);
+        }
         let mut chain = effects.to_vec();
         chain.resize(self.ivars().installed.len(), false);
         *self.ivars().chain.borrow_mut() = chain;
@@ -817,6 +1044,12 @@ impl AppHandler {
             path: PathBuf::new(),
             duration: 0.0,
             effects: vec![false; ivars.installed.len()],
+            fade_target: None,
+            stop_after_fade: true,
+            auto_continue: cue::AutoContinue::None,
+            gain: 1.0,
+            gain_l: 1.0,
+            gain_r: 1.0,
         });
 
         let index = cues.len() - 1;
@@ -833,9 +1066,69 @@ impl AppHandler {
         ivars.cue_id.setStringValue(&NSString::new());
         ivars.cue_name.setStringValue(&NSString::new());
         ivars.field.setStringValue(&NSString::new());
+        ivars.cue_duration.setStringValue(&NSString::new());
+        ivars.fade_target.setStringValue(&NSString::new());
+
+        ivars.field.setEnabled(true);
+        ivars.field.setEditable(true);
+        ivars.cue_duration.setEnabled(false);
+        ivars.cue_duration.setEditable(false);
+        ivars.fade_target.setEnabled(false);
+        ivars.fade_target.setEditable(false);
 
         *ivars.enabled.borrow_mut() = vec![false; ivars.installed.len()];
         ivars.available_table.reloadData();
+
+        self.load_cue_levels(index);
+        self.set_error(String::new());
+    }
+
+    fn add_fade_cue(&self) {
+        let ivars = self.ivars();
+        let mut cues = ivars.cues.borrow_mut();
+
+        cues.push(cue::Cue {
+            id: String::new(),
+            name: String::new(),
+            path: PathBuf::new(),
+            duration: 0.0,
+            effects: vec![false; ivars.installed.len()],
+            fade_target: Some(String::new()),
+            stop_after_fade: true,
+            auto_continue: cue::AutoContinue::None,
+            gain: 1.0,
+            gain_l: 1.0,
+            gain_r: 1.0,
+        });
+
+        let index = cues.len() - 1;
+        drop(cues);
+
+        ivars.active_cue.set(index);
+        ivars.cue_table.reloadData();
+
+        let selected = NSIndexSet::indexSetWithIndex(index);
+        ivars
+            .cue_table
+            .selectRowIndexes_byExtendingSelection(&selected, false);
+
+        ivars.cue_id.setStringValue(&NSString::new());
+        ivars.cue_name.setStringValue(&NSString::new());
+        ivars.field.setStringValue(&NSString::new());
+        ivars.cue_duration.setStringValue(&NSString::new());
+        ivars.fade_target.setStringValue(&NSString::new());
+
+        ivars.field.setEnabled(false);
+        ivars.field.setEditable(false);
+        ivars.cue_duration.setEnabled(true);
+        ivars.cue_duration.setEditable(true);
+        ivars.fade_target.setEnabled(true);
+        ivars.fade_target.setEditable(true);
+
+        *ivars.enabled.borrow_mut() = vec![false; ivars.installed.len()];
+        ivars.available_table.reloadData();
+
+        self.load_cue_levels(index);
         self.set_error(String::new());
     }
 
@@ -892,31 +1185,99 @@ impl AppHandler {
 
     fn save_cue(&self) {
         let ivars = self.ivars();
-        let row = ivars.active_cue.get();
+        let row = ivars.cue_table.selectedRow();
 
+        if row < 0 {
+            self.set_error("Select a cue first".to_string());
+            return;
+        }
+
+        let row = row as usize;
         let id = ivars.cue_id.stringValue().to_string().trim().to_string();
         let name = ivars.cue_name.stringValue().to_string().trim().to_string();
-        let path = PathBuf::from(ivars.field.stringValue().to_string().trim());
 
         if id.is_empty() {
             self.set_error("Cue ID is required".to_string());
             return;
         }
 
-        if !helpers::is_audio_path(&path) {
-            self.set_error(format!("Not a supported audio file: {}", path.display()));
-            return;
-        }
+        let (is_fade, effects, gain, gain_l, gain_r) = {
+            let cues = ivars.cues.borrow();
 
-        let duration = match helpers::audio_duration(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                self.set_error(e.to_string());
+            let Some(cue) = cues.get(row) else {
+                return;
+            };
+
+            (
+                cue.fade_target.is_some(),
+                cue.effects.clone(),
+                cue.gain,
+                cue.gain_l,
+                cue.gain_r,
+            )
+        };
+
+        let (path, duration, fade_target) = if is_fade {
+            let target = ivars
+                .fade_target
+                .stringValue()
+                .to_string()
+                .trim()
+                .to_string();
+
+            if target.is_empty() {
+                self.set_error("Fade target is required".to_string());
                 return;
             }
+
+            if target == id {
+                self.set_error("A fade cue cannot target itself".to_string());
+                return;
+            }
+
+            let duration_text = ivars.cue_duration.stringValue().to_string();
+
+            let duration = match duration_text.trim().parse::<f64>() {
+                Ok(value) if value.is_finite() && value >= 0.0 => value,
+                _ => {
+                    self.set_error("Enter a valid fade duration in seconds".to_string());
+                    return;
+                }
+            };
+
+            let cues = ivars.cues.borrow();
+
+            if !cues
+                .iter()
+                .enumerate()
+                .any(|(i, cue)| i != row && cue.id == target)
+            {
+                self.set_error(format!("Fade target {target} does not exist"));
+                return;
+            }
+
+            (PathBuf::new(), duration, Some(target))
+        } else {
+            let path = PathBuf::from(ivars.field.stringValue().to_string().trim());
+
+            if !helpers::is_audio_path(&path) {
+                self.set_error(format!("Not a supported audio file: {}", path.display()));
+                return;
+            }
+
+            let duration = match helpers::audio_duration(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.set_error(e.to_string());
+                    return;
+                }
+            };
+
+            (path, duration, None)
         };
 
         let mut cues = ivars.cues.borrow_mut();
+
         if row >= cues.len() {
             return;
         }
@@ -929,14 +1290,28 @@ impl AppHandler {
             self.set_error(format!("Cue ID {id} already exists"));
             return;
         }
-        let effects = cues[row].effects.clone();
+
+        let stop_after_fade = ivars.stop_after_fade.indexOfSelectedItem() == 0;
+        let auto_continue = match ivars.auto_continue.indexOfSelectedItem() {
+            1 => cue::AutoContinue::Continue,
+            2 => cue::AutoContinue::Follow,
+            _ => cue::AutoContinue::None,
+        };
+
         cues[row] = cue::Cue {
             id,
             name,
             path,
             duration,
             effects,
+            fade_target,
+            stop_after_fade,
+            auto_continue,
+            gain,
+            gain_l,
+            gain_r,
         };
+
         drop(cues);
 
         ivars.cue_table.reloadData();
@@ -949,21 +1324,52 @@ impl AppHandler {
 
         let id = ivars.cue_id.stringValue().to_string();
         let name = ivars.cue_name.stringValue().to_string();
-        let path = PathBuf::from(ivars.field.stringValue().to_string());
 
-        let duration = if helpers::is_audio_path(&path) {
-            helpers::audio_duration(&path).unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        let is_fade = ivars
+            .cues
+            .borrow()
+            .get(row)
+            .is_some_and(|cue| cue.fade_target.is_some());
 
         let mut cues = ivars.cues.borrow_mut();
 
         if let Some(cue) = cues.get_mut(row) {
             cue.id = id;
             cue.name = name;
-            cue.path = path;
-            cue.duration = duration;
+
+            if is_fade {
+                cue.fade_target = Some(
+                    ivars
+                        .fade_target
+                        .stringValue()
+                        .to_string()
+                        .trim()
+                        .to_string(),
+                );
+
+                cue.duration = ivars
+                    .cue_duration
+                    .stringValue()
+                    .to_string()
+                    .trim()
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
+
+                cue.stop_after_fade = ivars.stop_after_fade.indexOfSelectedItem() == 0;
+                cue.auto_continue = match ivars.auto_continue.indexOfSelectedItem() {
+                    1 => cue::AutoContinue::Continue,
+                    2 => cue::AutoContinue::Follow,
+                    _ => cue::AutoContinue::None,
+                };
+            } else {
+                let path = PathBuf::from(ivars.field.stringValue().to_string());
+                cue.duration = if helpers::is_audio_path(&path) {
+                    helpers::audio_duration(&path).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                cue.path = path;
+            }
         }
 
         drop(cues);
@@ -973,6 +1379,7 @@ impl AppHandler {
     fn load_selected_cue(&self) {
         let ivars = self.ivars();
         let row = ivars.active_cue.get();
+
         let cue = {
             let cues = ivars.cues.borrow();
             let Some(cue) = cues.get(row) else {
@@ -980,6 +1387,8 @@ impl AppHandler {
             };
             cue.clone()
         };
+
+        let is_fade = cue.fade_target.is_some();
 
         ivars.active_cue.set(row);
         ivars.cue_id.setStringValue(&NSString::from_str(&cue.id));
@@ -990,18 +1399,52 @@ impl AppHandler {
             .field
             .setStringValue(&NSString::from_str(&cue.path.to_string_lossy()));
 
+        let dur_str = cue.duration.to_string();
+        ivars
+            .cue_duration
+            .setStringValue(&NSString::from_str(if is_fade { &dur_str } else { "" }));
+
+        ivars.fade_target.setStringValue(&NSString::from_str(
+            cue.fade_target.as_deref().unwrap_or(""),
+        ));
+
+        ivars.field.setEnabled(!is_fade);
+        ivars.field.setEditable(!is_fade);
+
+        ivars.cue_duration.setEnabled(is_fade);
+        ivars.cue_duration.setEditable(is_fade);
+
+        ivars.fade_target.setEnabled(is_fade);
+        ivars.fade_target.setEditable(is_fade);
+
         let mut fx = cue.effects.clone();
         fx.resize(ivars.installed.len(), false);
         *ivars.enabled.borrow_mut() = fx;
 
         let sel = ivars.available_table.selectedRow();
         ivars.available_table.reloadData();
+
         if sel >= 0 {
             ivars.available_table.selectRowIndexes_byExtendingSelection(
                 &NSIndexSet::indexSetWithIndex(sel as usize),
                 false,
             );
         }
+
+        ivars
+            .stop_after_fade
+            .selectItemAtIndex(if cue.stop_after_fade { 0 } else { 1 });
+
+        let auto_index = match cue.auto_continue {
+            cue::AutoContinue::None => 0,
+            cue::AutoContinue::Continue => 1,
+            cue::AutoContinue::Follow => 2,
+        };
+
+        ivars.auto_continue.selectItemAtIndex(auto_index);
+
+        self.load_cue_levels(row);
+
         self.set_error(String::new());
     }
 }

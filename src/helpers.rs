@@ -121,24 +121,33 @@ pub fn editor_window(mtm: MainThreadMarker, view: &NSView, title: &str) -> Retai
     window
 }
 
-pub fn fade_out<F>(sh: std::sync::Arc<rt::Shared>, on_complete: F) -> Retained<NSTimer>
+pub fn fade_out<F>(
+    sh: std::sync::Arc<rt::Shared>,
+    duration: f64,
+    on_complete: F,
+) -> Retained<NSTimer>
 where
     F: FnOnce() + 'static,
 {
     let start = Instant::now();
+    let start_fade = sh.fade();
     let on_complete = RefCell::new(Some(on_complete));
+
     let block = RcBlock::new(move |timer: NonNull<NSTimer>| {
-        let progress = start.elapsed().as_secs_f32() / FADE_SECS;
+        let progress = (start.elapsed().as_secs_f64() / duration.max(0.001)).min(1.0) as f32;
+
+        sh.set_fade(start_fade * (1.0 - progress));
+
         if progress >= 1.0 {
             sh.set_fade(0.0);
             unsafe { timer.as_ref().invalidate() };
+
             if let Some(cb) = on_complete.borrow_mut().take() {
                 cb();
             }
-        } else {
-            sh.set_fade(fade_gain(1.0, FADE_MIN_DB, progress));
         }
     });
+
     unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(FADE_TICK_SECS, true, &block) }
 }
 

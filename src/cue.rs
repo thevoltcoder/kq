@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AutoContinue {
+    None,
+    Continue,
+    Follow,
+}
+
 #[derive(Clone)]
 pub struct Cue {
     pub id: String,
@@ -7,6 +14,12 @@ pub struct Cue {
     pub path: PathBuf,
     pub duration: f64,
     pub effects: Vec<bool>,
+    pub fade_target: Option<String>,
+    pub stop_after_fade: bool,
+    pub auto_continue: AutoContinue,
+    pub gain: f32,
+    pub gain_l: f32,
+    pub gain_r: f32,
 }
 
 pub struct CueIvars {
@@ -150,6 +163,12 @@ impl CueController {
             path,
             duration,
             effects: Vec::new(),
+            fade_target: None,
+            stop_after_fade: true,
+            auto_continue: AutoContinue::None,
+            gain: 1.0,
+            gain_l: 1.0,
+            gain_r: 1.0,
         });
         ivars.table.reloadData();
         ivars.cue_id.setStringValue(&NSString::new());

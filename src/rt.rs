@@ -206,8 +206,36 @@ impl Shared {
         }
     }
 
+    pub fn fade(&self) -> f32 {
+        f32::from_bits(self.fade.load(Ordering::Relaxed))
+    }
+
     pub fn set_fade(&self, v: f32) {
         self.fade.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+
+    pub fn gain_l(&self) -> f32 {
+        f32::from_bits(self.gain_l.load(Ordering::Relaxed))
+    }
+
+    pub fn gain_r(&self) -> f32 {
+        f32::from_bits(self.gain_r.load(Ordering::Relaxed))
+    }
+
+    pub fn set_gain(&self, v: f32) {
+        self.gain.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_gain_l(&self, v: f32) {
+        self.gain_l.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_gain_r(&self, v: f32) {
+        self.gain_r.store(v.to_bits(), Ordering::Relaxed);
     }
 }
 
